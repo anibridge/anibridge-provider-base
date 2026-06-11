@@ -31,7 +31,7 @@ Implementation guide
 2. Advertise native vocabularies through capabilities
 
     Provider-native names are open strings. Use them in `Node.kind`, `Record.kind`,
-    `Event.kind`, `Step.axis`, `Progress.unit`, artwork roles, and `State.flags`.
+    `Event.kind`, `Step.axis`, `Progress.unit`, and artwork roles.
 
     Closed enums are the values AniBridge reasons over: `Status`, `RecordField`,
     `NodeFlag`, `FacetName`, `ChangeKind`, `WriteOp`, `TemporalPrecision`, `WriteError`
@@ -121,8 +121,14 @@ Implementation guide
     `FieldSpec.constraints`.
 
     Use field constraints to describe what the provider can represent or accept:
-    date-vs-datetime precision, numeric range and step, text length, and similar limits.
-    Constraints describe provider limits, not alternate normalized value types.
+    date-vs-datetime precision, numeric range and step, text length, progress shape,
+    and similar limits. Constraints describe provider limits, not alternate normalized
+    value types.
+
+    For `RecordField.PROGRESS`, `Progress.current` is the synced user-state value.
+    `Progress.total` and `Progress.unit` describe the shape of that progress channel.
+    Providers that derive total/unit from media metadata instead of user state should
+    advertise that with `ProgressConstraint(total=False, unit=False)`.
 
 8. Separate method presence from method granularity
 
@@ -183,6 +189,7 @@ __all__ = [
     "Page",
     "Part",
     "Progress",
+    "ProgressConstraint",
     "Provider",
     "Rating",
     "Record",
@@ -341,7 +348,22 @@ class TextConstraint:
             raise ValueError("TextConstraint.max_length must be >= 0")
 
 
-type FieldConstraint = TemporalConstraint | NumericConstraint | TextConstraint
+@dataclass(frozen=True, slots=True)
+class ProgressConstraint:
+    """Which `Progress` dimensions are writable/comparable user state.
+
+    `Progress.current` is always the synced value for `RecordField.PROGRESS`. Set
+    `total` or `unit` to false when the provider owns those dimensions as media
+    metadata rather than writable progress state.
+    """
+
+    total: bool = True
+    unit: bool = True
+
+
+type FieldConstraint = (
+    TemporalConstraint | NumericConstraint | TextConstraint | ProgressConstraint
+)
 
 
 class FacetName(StrEnum):
