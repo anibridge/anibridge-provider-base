@@ -509,6 +509,9 @@ class ExternalId:
             return f"{self.authority}:{self.value}"
         return f"{self.authority}:{self.value}:{self.scope}"
 
+    def __repr__(self) -> str:
+        """Debug-friendly descriptor form."""
+        return self.descriptor
 
 @dataclass(frozen=True, slots=True)
 class Step:
@@ -549,6 +552,11 @@ class Ref:
     def child(self, axis: str, value: int | str) -> Ref:
         """Extend this ref one coordinate deeper."""
         return Ref(self.key, (*self.path, Step(axis, value)))
+    
+    def __repr__(self) -> str:
+        """Debug-friendly string form showing the key and path."""
+        path_str = ",".join(f"{step.axis}={step.value}" for step in self.path)
+        return f"{self.key}:{path_str}" if path_str else str(self.key)
 
 
 @dataclass(frozen=True, slots=True)
