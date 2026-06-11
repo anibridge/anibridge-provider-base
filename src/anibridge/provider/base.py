@@ -637,7 +637,6 @@ class State:
 
     native: str | None = None
     status: Status | None = None
-    flags: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -685,6 +684,7 @@ class Record:
     url: str | None = None
     updated_at: datetime | None = None  # last mutation time (UTC); drives LWW
     revision: str | None = None
+    ids: tuple[ExternalId, ...] = ()
     values: Mapping[RecordField, Value] = field(default_factory=dict)
     metadata: Mapping[str, MetaValue] = field(default_factory=dict)
 
@@ -737,15 +737,21 @@ class BackupArtifact:
 
 @dataclass(frozen=True, slots=True)
 class Page[ItemT]:
-    """One page of results with an opaque continuation cursor."""
+    """One page of results with an opaque continuation cursor.
+
+    `total`, when known, is the total number of items matching the query across
+    all pages. Providers may leave it unset when calculating a total would require
+    extra work or the remote API does not expose one.
+    """
 
     items: tuple[ItemT, ...]
     cursor: str | None = None
+    total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ScanItem:
-    """A node paired with its user records during a library scan."""
+    """A node paired with its user records during source enumeration."""
 
     node: Node
     records: tuple[Record, ...] = ()
@@ -785,7 +791,7 @@ class RecordQuery:
 
 @dataclass(frozen=True, slots=True)
 class ScanQuery:
-    """High-throughput enumeration of a library or section.
+    """Source enumeration.
 
     `ScanQuery` is separate from `NodeQuery`, which is optimized for targeted ref
     lookups. The `native_*_kinds` filters use the provider's own open-string kinds.
@@ -1002,7 +1008,37 @@ class FieldSpec:
     description: str | None = None
 
     def __post_init__(self) -> None:
-        """Reject ambiguous duplicate constraint families."""
+        """Reject ambiguous field capability declarations."""
+        if self.field != RecordField.STATUS and self.values:
+            raise ValueError("FieldSpec.values is only valid for RecordField.STATUS")
+
+        if self.field == RecordField.STATUS and (self.readable or self.writable):
+            if not self.values:
+                raise ValueError(
+                    "STATUS fields must declare supported native values"
+                )
+
+            seen_native: set[str] = set()
+            seen_writable_semantics: set[Status] = set()
+            for descriptor in self.values:
+                if descriptor.semantic is None:
+                    raise ValueError(
+                        "STATUS field values must map to a normalized Status"
+                    )
+                if descriptor.native in seen_native:
+                    raise ValueError(
+                        f"duplicate STATUS native value: {descriptor.native!r}"
+                    )
+                seen_native.add(descriptor.native)
+                if not self.writable:
+                    continue
+                if descriptor.semantic in seen_writable_semantics:
+                    raise ValueError(
+                        f"duplicate writable STATUS semantic: "
+                        f"{descriptor.semantic!r}"
+                    )
+                seen_writable_semantics.add(descriptor.semantic)
+
         seen: set[type[FieldConstraint]] = set()
         for constraint in self.constraints:
             constraint_type = type(constraint)
@@ -1024,8 +1060,13 @@ class Capabilities:
     semantics so the bridge can translate across providers. `coordinate_axes` maps a
     native node kind to its ordered axis vocabulary, such as "show" -> ("season",
     "episode"), so the bridge can know a kind's coordinate space without hydrating
-    `STRUCTURE`. `external_authorities` holds descriptor authority tokens this provider
-    can emit or resolve.
+    `STRUCTURE`.
+
+    `external_authorities` holds AniMap descriptor authority tokens this provider can
+    emit or resolve. These are mapping-database identifiers, not provider namespaces:
+    `Provider.NAMESPACE` identifies the AniBridge plugin/provider implementation, while
+    authorities such as "anilist", "tmdb_show", or "tvdb_movie" identify mapping graph
+    nodes.
     """
 
     roles: frozenset[Role] = field(default_factory=frozenset)
@@ -1100,7 +1141,7 @@ class SupportsNodeReads(ABC):
 
 
 class SupportsScan(ABC):
-    """High-throughput enumeration of a library/section."""
+    """Source enumeration."""
 
     @abstractmethod
     async def scan(self, query: ScanQuery) -> Page[ScanItem]:
@@ -1130,7 +1171,13 @@ class SupportsRecordReads(ABC):
 
 
 class SupportsRecordWrites(ABC):
-    """Record mutations. Granularity is advertised in `write_ops`."""
+    """Record mutations. Granularity is advertised in `write_ops`.
+
+    Results are positional and independent. Providers may optimize multiple writes
+    internally, but should not expose partial batch ambiguity: when one write fails,
+    return a failed `WriteResult` for that write instead of raising after applying an
+    unknown subset.
+    """
 
     @abstractmethod
     async def write_records(
