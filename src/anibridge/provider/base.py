@@ -126,6 +126,8 @@ Implementation guide
     value types.
 
     For `RecordField.PROGRESS`, `Progress.current` is the synced user-state value.
+    Providers with bounded or discrete progress counts should describe that current
+    value with `ProgressConstraint(current=NumericConstraint(...))`.
     `Progress.total` and `Progress.unit` describe the shape of that progress channel.
     Providers that derive total/unit from media metadata instead of user state should
     advertise that with `ProgressConstraint(total=False, unit=False)`.
@@ -354,10 +356,13 @@ class ProgressConstraint:
     """Which `Progress` dimensions are writable/comparable user state.
 
     `Progress.current` is always the synced value for `RecordField.PROGRESS`. Set
-    `total` or `unit` to false when the provider owns those dimensions as media
+    `current` when the provider only accepts a bounded or quantized progress value.
+    Progress quantization floors partial units because progress counts completed units.
+    Set `total` or `unit` to false when the provider owns those dimensions as media
     metadata rather than writable progress state.
     """
 
+    current: NumericConstraint | None = None
     total: bool = True
     unit: bool = True
 
@@ -513,6 +518,7 @@ class ExternalId:
     def __repr__(self) -> str:
         """Debug-friendly descriptor form."""
         return self.descriptor
+
 
 @dataclass(frozen=True, slots=True)
 class Step:
@@ -1045,9 +1051,7 @@ class FieldSpec:
 
         if self.field == RecordField.STATUS and (self.readable or self.writable):
             if not self.values:
-                raise ValueError(
-                    "STATUS fields must declare supported native values"
-                )
+                raise ValueError("STATUS fields must declare supported native values")
 
             seen_native: set[str] = set()
             seen_writable_semantics: set[Status] = set()
@@ -1065,8 +1069,7 @@ class FieldSpec:
                     continue
                 if descriptor.semantic in seen_writable_semantics:
                     raise ValueError(
-                        f"duplicate writable STATUS semantic: "
-                        f"{descriptor.semantic!r}"
+                        f"duplicate writable STATUS semantic: {descriptor.semantic!r}"
                     )
                 seen_writable_semantics.add(descriptor.semantic)
 
