@@ -218,6 +218,7 @@ __all__ = [
     "SupportsInboundChanges",
     "SupportsMapping",
     "SupportsNodeReads",
+    "SupportsNodeSearch",
     "SupportsRecordReads",
     "SupportsRecordWrites",
     "SupportsScan",
@@ -552,7 +553,7 @@ class Ref:
     def child(self, axis: str, value: int | str) -> Ref:
         """Extend this ref one coordinate deeper."""
         return Ref(self.key, (*self.path, Step(axis, value)))
-    
+
     def __repr__(self) -> str:
         """Debug-friendly string form showing the key and path."""
         path_str = ",".join(f"{step.axis}={step.value}" for step in self.path)
@@ -1168,6 +1169,20 @@ class SupportsNodeReads(ABC):
     @abstractmethod
     async def fetch_nodes(self, query: NodeQuery) -> Page[Node]:
         """Fetch nodes matching the requested query projection."""
+
+
+class SupportsNodeSearch(ABC):
+    """Provider catalog search by user-entered text."""
+
+    @abstractmethod
+    async def search_nodes(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        facets: frozenset[FacetName] = frozenset(),
+    ) -> Page[Node]:
+        """Search provider catalog nodes matching the requested text."""
 
 
 class SupportsScan(ABC):
