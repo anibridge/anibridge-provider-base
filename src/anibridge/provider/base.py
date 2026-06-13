@@ -111,10 +111,11 @@ Implementation guide
     If the bridge must understand a value, model it as a normalized field, facet, flag,
     descriptor, or constraint instead of putting it in metadata.
 
-7. Normalize datetimes and constraints
+7. Normalize temporal values and constraints
 
     Every datetime crossing this contract must be timezone-aware UTC. A naive datetime
-    is a contract violation.
+    is a contract violation. Date-precision values should be represented as `date`,
+    not as artificial midnight datetimes.
 
     If a provider only supports date-level precision, advertise that with
     `TemporalConstraint(precision=TemporalPrecision.DATE)` in the relevant
@@ -122,8 +123,8 @@ Implementation guide
 
     Use field constraints to describe what the provider can represent or accept:
     date-vs-datetime precision, numeric range and step, text length, progress shape,
-    and similar limits. Constraints describe provider limits, not alternate normalized
-    value types.
+    and similar limits. Temporal constraints also tell the bridge how to translate
+    between date and datetime providers.
 
     For `RecordField.PROGRESS`, `Progress.current` is the synced user-state value.
     Providers with bounded or discrete progress counts should describe that current
@@ -147,7 +148,7 @@ Implementation guide
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from logging import Logger
 from typing import ClassVar
@@ -279,8 +280,8 @@ class RecordField(StrEnum):
         STATUS           -> State
         PROGRESS         -> Progress
         RATING           -> Rating
-        STARTED_AT       -> datetime (UTC)
-        FINISHED_AT      -> datetime (UTC)
+        STARTED_AT       -> date or UTC datetime
+        FINISHED_AT      -> date or UTC datetime
         LAST_ACTIVITY_AT -> datetime (UTC)
         REPEAT_COUNT     -> int
         NOTES            -> str
@@ -297,10 +298,10 @@ class RecordField(StrEnum):
 
 
 class TemporalPrecision(StrEnum):
-    """Temporal precision advertised for a datetime field constraint.
+    """Temporal precision advertised for a temporal field constraint.
 
-    If the advertised precision is `DATE`, the provider will reduce precision during
-    date/datetime translation between providers and treat datetimes as dates.
+    If the advertised precision is `DATE`, providers should return date values and
+    the bridge will reduce incoming datetimes during translation.
     """
 
     DATE = "date"
@@ -699,7 +700,7 @@ class Rating:
 
 # The value union for record fields. A field is unset by being absent from
 # `Record.values`, never by storing `None`.
-type Value = State | Progress | Rating | Scalar | datetime
+type Value = State | Progress | Rating | Scalar | date | datetime
 
 
 @dataclass(frozen=True, slots=True)
