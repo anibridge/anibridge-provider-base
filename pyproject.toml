@@ -1,6 +1,6 @@
 [project]
 name = "anibridge-provider-base"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Provider contracts for the AniBridge project."
 license = "MIT"
 license-files = ["LICENSE"]
@@ -32,7 +32,26 @@ indent-style = "space"
 quote-style = "double"
 
 [tool.ruff.lint]
-select = ["B", "D", "DOC", "E", "F", "I", "RUF", "SIM", "UP", "W"]
+select = [
+    "A",
+    "ASYNC",
+    "B",
+    "C4",
+    "D",
+    "E",
+    "F",
+    "FURB",
+    "G",
+    "I",
+    "N",
+    "PERF",
+    "PLC",
+    "PLE",
+    "RUF",
+    "SIM",
+    "UP",
+    "W",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["D"]
