@@ -1,4 +1,6 @@
-import asyncio
+"""Tests for the AniBridge provider base contract."""
+
+import inspect
 import logging
 import re
 from collections.abc import Callable
@@ -14,11 +16,10 @@ from anibridge.provider.base import (
     BackupArtifact,
     Capabilities,
     ChangeKind,
-    DeleteEvent,
-    DeleteRecord,
     Descriptor,
     EventChange,
     EventKind,
+    EventSpec,
     ExternalId,
     FacetName,
     FieldSpec,
@@ -31,6 +32,7 @@ from anibridge.provider.base import (
     NodeFlag,
     NodeKind,
     NodeQuery,
+    NodeSpec,
     NumericConstraint,
     Page,
     Part,
@@ -42,6 +44,8 @@ from anibridge.provider.base import (
     RecordChange,
     RecordField,
     RecordKind,
+    RecordQuery,
+    RecordSpec,
     Ref,
     Role,
     ScanItem,
@@ -53,7 +57,6 @@ from anibridge.provider.base import (
     SupportsBackupImports,
     SupportsChangeFeed,
     SupportsEventReads,
-    SupportsEventSummaries,
     SupportsEventWrites,
     SupportsInboundChanges,
     SupportsMapping,
@@ -62,8 +65,6 @@ from anibridge.provider.base import (
     SupportsRecordReads,
     SupportsRecordWrites,
     SupportsScan,
-    TemporalConstraint,
-    TemporalPrecision,
     TextConstraint,
     Titles,
     UpsertRecord,
@@ -129,21 +130,25 @@ def test_artwork_poster_reads_conventional_role() -> None:
 @pytest.mark.parametrize(
     ("constraint", "error"),
     [
-        (
+        pytest.param(
             lambda: NumericConstraint(step=0),
             "NumericConstraint.step must be > 0",
+            id="zero-step",
         ),
-        (
+        pytest.param(
             lambda: NumericConstraint(minimum=10, maximum=1),
             "NumericConstraint.minimum must be <= NumericConstraint.maximum",
+            id="inverted-range",
         ),
-        (
+        pytest.param(
             lambda: TextConstraint(max_length=-1),
             "TextConstraint.max_length must be >= 0",
+            id="negative-text-limit",
         ),
-        (
+        pytest.param(
             lambda: BackupArtifact(b"{}", file_extension="json"),
             "BackupArtifact.file_extension must start with '.'",
+            id="bad-extension",
         ),
     ],
 )
@@ -184,27 +189,6 @@ def test_field_spec_rejects_status_values_on_non_status_fields() -> None:
         )
 
 
-def test_field_spec_rejects_private_status_values() -> None:
-    with pytest.raises(
-        ValueError, match="STATUS field values must map to a normalized Status"
-    ):
-        FieldSpec(
-            RecordField.STATUS,
-            values=(Descriptor("Watching"),),
-        )
-
-
-def test_field_spec_rejects_duplicate_status_native_values() -> None:
-    with pytest.raises(ValueError, match="duplicate STATUS native value: 'Watching'"):
-        FieldSpec(
-            RecordField.STATUS,
-            values=(
-                Descriptor("Watching", Status.ACTIVE),
-                Descriptor("Watching", Status.COMPLETED),
-            ),
-        )
-
-
 def test_field_spec_rejects_duplicate_writable_status_semantics() -> None:
     with pytest.raises(
         ValueError,
@@ -220,45 +204,30 @@ def test_field_spec_rejects_duplicate_writable_status_semantics() -> None:
         )
 
 
-def test_field_spec_allows_duplicate_readonly_status_semantics() -> None:
-    spec = FieldSpec(
-        RecordField.STATUS,
-        writable=False,
-        values=(
-            Descriptor("Watching", Status.ACTIVE),
-            Descriptor("Rewatching", Status.ACTIVE),
-        ),
-    )
-
-    assert spec.values[1].native == "Rewatching"
-
-
-def test_field_spec_rejects_duplicate_constraint_types() -> None:
+def test_specs_reject_mismatched_fields_and_wrong_write_ops() -> None:
     with pytest.raises(
-        ValueError, match="duplicate field constraint type: NumericConstraint"
+        ValueError,
+        match=re.escape("RecordSpec.fields keys must match FieldSpec.field"),
     ):
-        FieldSpec(
-            RecordField.RATING,
-            constraints=(
-                NumericConstraint(minimum=0, maximum=10),
-                NumericConstraint(step=0.5),
-            ),
+        RecordSpec(
+            Descriptor("progress", RecordKind.PROGRESS),
+            fields={RecordField.STATUS: FieldSpec(RecordField.NOTES)},
+        )
+
+    with pytest.raises(ValueError, match="contains event operations"):
+        RecordSpec(
+            Descriptor("progress", RecordKind.PROGRESS),
+            write_ops=frozenset({WriteOp.APPEND_EVENT}),
+        )
+
+    with pytest.raises(ValueError, match="contains record operations"):
+        EventSpec(
+            Descriptor("scrobble", EventKind.SCROBBLE),
+            write_ops=frozenset({WriteOp.UPSERT_RECORD}),
         )
 
 
-def test_field_spec_accepts_mixed_constraints() -> None:
-    spec = FieldSpec(
-        RecordField.FINISHED_AT,
-        constraints=(
-            TemporalConstraint(TemporalPrecision.DATE),
-            TextConstraint(max_length=16),
-        ),
-    )
-
-    assert spec.constraints[0] == TemporalConstraint(TemporalPrecision.DATE)
-
-
-def test_capabilities_can_describe_provider_vocabularies() -> None:
+def test_capabilities_describe_current_provider_vocabularies() -> None:
     status_spec = FieldSpec(
         RecordField.STATUS,
         writable=True,
@@ -267,24 +236,36 @@ def test_capabilities_can_describe_provider_vocabularies() -> None:
             Descriptor("completed", Status.COMPLETED),
         ),
     )
+    node_spec = NodeSpec(
+        Descriptor("show", NodeKind.SERIES),
+        flags=frozenset({NodeFlag.ANCHOR}),
+        coordinate_axes=("season", "episode"),
+    )
+    record_spec = RecordSpec(
+        Descriptor("progress", RecordKind.PROGRESS),
+        fields={RecordField.STATUS: status_spec},
+        write_ops=frozenset({WriteOp.UPSERT_RECORD}),
+    )
+    event_spec = EventSpec(
+        Descriptor("scrobble", EventKind.SCROBBLE),
+        write_ops=frozenset({WriteOp.APPEND_EVENT}),
+        idempotent_appends=True,
+    )
 
     capabilities = Capabilities(
         roles=frozenset({Role.SOURCE, Role.TARGET}),
         facets=frozenset({FacetName.TITLES, FacetName.IDS}),
-        node_kinds=(Descriptor("show", NodeKind.SERIES),),
-        coordinate_axes={"show": ("season", "episode")},
-        record_kinds=(Descriptor("progress", RecordKind.PROGRESS),),
-        record_fields={RecordField.STATUS: status_spec},
-        event_kinds=(Descriptor("play", EventKind.PLAY),),
-        write_ops=frozenset({WriteOp.UPSERT_RECORD}),
+        nodes=(node_spec,),
+        records=(record_spec,),
+        events=(event_spec,),
         change_kinds=frozenset({ChangeKind.RECORD}),
         external_authorities=frozenset({"anilist"}),
     )
 
-    assert capabilities.roles == frozenset({Role.SOURCE, Role.TARGET})
-    assert capabilities.node_kinds[0].semantic is NodeKind.SERIES
-    assert capabilities.coordinate_axes["show"] == ("season", "episode")
-    assert capabilities.record_fields[RecordField.STATUS] is status_spec
+    assert capabilities.nodes[0].kind.semantic is NodeKind.SERIES
+    assert capabilities.nodes[0].coordinate_axes == ("season", "episode")
+    assert capabilities.records[0].fields[RecordField.STATUS] is status_spec
+    assert capabilities.events[0].kind.semantic is EventKind.SCROBBLE
 
 
 def test_catalog_and_record_value_objects_keep_provider_data() -> None:
@@ -329,7 +310,7 @@ def test_catalog_and_record_value_objects_keep_provider_data() -> None:
 def test_pages_and_queries_hold_pagination_and_projection_state() -> None:
     ref = Ref.anchor("show-1")
     node = Node(ref, "show")
-    record = Record(ref)
+    record = Record(ref, "progress")
     scan_item = ScanItem(node, (record,))
 
     node_page = Page((node,), cursor="next", total=2)
@@ -337,16 +318,23 @@ def test_pages_and_queries_hold_pagination_and_projection_state() -> None:
         sources=(ref,),
         flags=frozenset({NodeFlag.SCAN_ROOT}),
         facets=frozenset({FacetName.TITLES}),
-        fields=frozenset({RecordField.STATUS}),
-        require_activity=True,
+        native_record_kinds=frozenset({"progress"}),
+        record_fields=frozenset({RecordField.STATUS}),
+        require_user_data=True,
         limit=25,
+    )
+    record_query = RecordQuery(
+        refs=(ref,),
+        native_record_kinds=("progress",),
+        fields=frozenset({RecordField.STATUS}),
     )
 
     assert node_page.items == (node,)
     assert node_page.cursor == "next"
     assert scan_item.records == (record,)
     assert scan_query.sources == (ref,)
-    assert scan_query.require_activity is True
+    assert scan_query.require_user_data is True
+    assert record_query.native_record_kinds == ("progress",)
 
 
 def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
@@ -362,9 +350,7 @@ def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
         set={RecordField.STATUS: Status.COMPLETED.value},
         clear=frozenset({RecordField.NOTES}),
     )
-    delete_record = DeleteRecord(ref=ref, kind="progress", token="tok-2")
-    append_event = AppendEvent(ref, "play", now, token="tok-3")
-    delete_event = DeleteEvent(ref=ref, kind="play", at=now, token="tok-4")
+    append_event = AppendEvent(ref, "scrobble", now, token="tok-2", dedupe_key="d1")
     result = WriteResult(
         ok=False,
         op=WriteOp.UPSERT_RECORD,
@@ -375,83 +361,45 @@ def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
     )
 
     assert upsert.expected_revision == "rev-1"
-    assert delete_record.token == "tok-2"
-    assert append_event.at == now
-    assert delete_event.kind == "play"
-    assert result.code is WriteError.CONFLICT
+    assert append_event.dedupe_key == "d1"
+    assert result.error == "stale revision"
+    assert NodeChange(ref=ref, at=now).at == now
+    assert RecordChange(ref=ref, kind="progress", at=now).kind == "progress"
+    assert EventChange(ref=ref, kind="scrobble", at=now).kind == "scrobble"
+    assert InboundResult(True, (NodeChange(ref=ref),)).matched is True
+    assert InboundRequest("POST", "/hook", body=b"{}").body == b"{}"
 
 
-def test_change_and_inbound_dtos_keep_notifications_framework_agnostic() -> None:
-    ref = Ref.anchor("show-1")
-    now = datetime(2026, 6, 13, tzinfo=UTC)
-    changes = (
-        NodeChange(ref=ref, at=now, facets=frozenset({FacetName.TITLES})),
-        RecordChange(ref=ref, kind="progress", fields=frozenset({RecordField.STATUS})),
-        EventChange(ref=ref, kind="play", at=now),
-    )
-    request = InboundRequest(
-        method="POST",
-        path="/webhook",
-        headers={"x-signature": "abc"},
-        query={"debug": ("1",)},
-        body=b"{}",
-    )
-    result = InboundResult(matched=True, changes=changes)
+def test_provider_base_stores_logger_and_config() -> None:
+    class TestProvider(Provider):
+        DISPLAY_NAME = "Test"
+        NAMESPACE = "test"
 
-    assert request.query["debug"] == ("1",)
-    assert result.changes == changes
+        def account(self) -> Account | None:
+            return None
 
+    provider = TestProvider(logger=logging.getLogger("test-provider"), config={"x": 1})
 
-class MinimalProvider(Provider):
-    DISPLAY_NAME = "Minimal"
-    NAMESPACE = "minimal"
-
-    def account(self) -> Account | None:
-        return Account("acct-1", "Test Account")
-
-
-def test_provider_base_stores_config_and_has_default_async_lifecycle() -> None:
-    logger = logging.getLogger("tests.provider")
-    provider = MinimalProvider(logger=logger, config={"token": "secret"})
-
-    assert provider.log is logger
-    assert provider.config == {"token": "secret"}
-    assert provider.account() == Account("acct-1", "Test Account")
-    assert provider.capabilities() == Capabilities()
-    asyncio.run(provider.initialize())
-    asyncio.run(provider.clear_cache())
-    asyncio.run(provider.close())
-
-
-def test_provider_copies_config_mapping() -> None:
-    config = {"token": "initial"}
-    provider = MinimalProvider(
-        logger=logging.getLogger("tests.provider"), config=config
-    )
-
-    config["token"] = "changed"
-
-    assert provider.config == {"token": "initial"}
+    assert provider.config == {"x": 1}
+    assert provider.account() is None
 
 
 @pytest.mark.parametrize(
-    "mixin",
+    ("protocol", "method_name"),
     [
-        SupportsNodeReads,
-        SupportsNodeSearch,
-        SupportsScan,
-        SupportsMapping,
-        SupportsRecordReads,
-        SupportsRecordWrites,
-        SupportsEventReads,
-        SupportsEventSummaries,
-        SupportsEventWrites,
-        SupportsChangeFeed,
-        SupportsBackupExports,
-        SupportsBackupImports,
-        SupportsInboundChanges,
+        pytest.param(SupportsScan, "scan", id="scan"),
+        pytest.param(SupportsNodeReads, "fetch_nodes", id="node-reads"),
+        pytest.param(SupportsNodeSearch, "search_nodes", id="node-search"),
+        pytest.param(SupportsRecordReads, "fetch_records", id="record-reads"),
+        pytest.param(SupportsRecordWrites, "write_records", id="record-writes"),
+        pytest.param(SupportsEventReads, "fetch_events", id="event-reads"),
+        pytest.param(SupportsEventWrites, "write_events", id="event-writes"),
+        pytest.param(SupportsChangeFeed, "poll_changes", id="change-feed"),
+        pytest.param(SupportsMapping, "resolve", id="mapping"),
+        pytest.param(SupportsInboundChanges, "parse_inbound", id="inbound"),
+        pytest.param(SupportsBackupExports, "export_backup", id="backup-export"),
+        pytest.param(SupportsBackupImports, "import_backup", id="backup-import"),
     ],
 )
-def test_support_mixins_are_abstract(mixin: type) -> None:
-    with pytest.raises(TypeError):
-        mixin()
+def test_protocol_methods_are_async(protocol: type[object], method_name: str) -> None:
+    assert inspect.iscoroutinefunction(getattr(protocol, method_name))

@@ -1,14 +1,12 @@
 """Provider contracts for AniBridge provider authors.
 
-This module defines the interface between AniBridge and a concrete media provider (e.g.
-Plex, AniList, Trakt, ...).
+This module defines the interface between AniBridge and a concrete media provider
+(Plex, AniList, Trakt, Jellyfin, MAL, and similar services).
 
-When implementing a provider, your job is to translate the provider's native objects,
-identifiers, lists, activity, and constraints into the normalized objects in this
-module. The contract is intentionally flexible so providers can keep their native shape,
-but the values you return must have precise semantics. AniBridge relies on those
-semantics to match media, compare state, plan writes, avoid duplicate work, and preserve
-provider-specific details where appropriate.
+Providers translate their native catalog, identity, aggregate user state, activity
+events, constraints, and write behavior into the normalized objects in this module.
+The contract is deliberately strict about semantics: AniBridge plans from these values,
+so every field must mean the same thing regardless of provider.
 
 ----------------------------------------------------------------------------------------
 Implementation guide
@@ -16,36 +14,51 @@ Implementation guide
 
 1. Start with identity: anchors, refs, and paths
 
-    The mappable unit is an anchor (a show, movie, manga, game, or similar media). A
-    `Ref` addresses that anchor by `key`. A `Ref` may also include a `path` of `Step`s
-    into the anchor's part space, such as season/episode/chapter.
+    The mappable unit is an anchor (a show, movie, manga, book series, game, or similar)
+    work. A `Ref` addresses that anchor by `key`. A `Ref` may include a `path` of
+    `Step`s into the anchor's coordinate space, such as season/episode/chapter.
 
     Use the same anchor key for every coordinate inside the same work. Add path steps
     when the provider exposes or accepts state below the anchor level.
 
     This lets AniBridge align providers that model parts differently. For example, one
-    provider may expose distinct episode objects, while another only exposes an
-    aggregate "12 episodes watched". Both still describe the same anchor plus coordinate
+    provider may expose distinct episode objects, while another only exposes aggregate
+    "12 episodes watched" state. Both still describe the same anchor plus coordinate
     space.
 
-2. Advertise native vocabularies through capabilities
+2. Keep catalog, state, and activity separate
+
+    `Node` is catalog data. It describes what exists, how it is identified, and what
+    coordinate space it has.
+
+    `Record` is current aggregate state about a ref in a named state channel, such as
+    progress, collection, watchlist, or ratings. Records are compared as latest state.
+
+    `Event` is immutable timestamped activity in a named activity channel, such as a
+    scrobble, check-in, rating, review, collection, or watchlist occurrence. Events are
+    compared as occurrences. Event-based providers should expose events directly
+    instead of forcing them into records.
+
+3. Advertise native vocabularies through capabilities
 
     Provider-native names are open strings. Use them in `Node.kind`, `Record.kind`,
     `Event.kind`, `Step.axis`, `Progress.unit`, and artwork roles.
 
     Closed enums are the values AniBridge reasons over: `Status`, `RecordField`,
-    `NodeFlag`, `FacetName`, `ChangeKind`, `WriteOp`, `TemporalPrecision`, `WriteError`
-    and the semantic kind enums `NodeKind`, `RecordKind`, and `EventKind`.
+    `NodeFlag`, `FacetName`, `ChangeAction`, `WriteOp`, `TemporalPrecision`,
+    `WriteError`, and the semantic kind enums `NodeKind`, `RecordKind`, and
+    `EventKind`.
 
-    In `capabilities()`, map each native kind to a closed semantic with a `Descriptor`.
-    AniBridge never compares native strings across providers. It maps source-native
-    values to semantics, chooses compatible target-native values for those semantics,
-    and translates from there.
+    In `capabilities()`, describe each supported node kind, record channel, and event
+    channel with a spec that maps native strings to a closed semantic. AniBridge never
+    compares native strings across providers. It maps source-native values to semantics,
+    chooses compatible target-native values for those semantics, and translates from
+    there.
 
     Use `semantic=None` for native values that should be kept for display or round-trip
     fidelity, but never used for cross-provider sync.
 
-3. Put operational node meaning in flags
+4. Put operational node meaning in flags
 
     `NodeKind` describes what a node is for display, grouping, and coordinate
     interpretation. `NodeFlag` describes how AniBridge may operate on that node.
@@ -58,11 +71,10 @@ Implementation guide
     `CONTAINER`: a node that can expand into addressable children or parts, such as a
     show with seasons, a season with episodes, or a book series with volumes.
 
-    `CONSUMABLE`: a leaf a user can complete, such as an episode, movie, chapter, track,
-    or other playable/readable unit.
+    `CONSUMABLE`: a leaf a user can complete, such as an episode, movie, chapter,
+    track, or other playable/readable unit.
 
-    `TRACKABLE`: a ref that can hold user state, such as progress, status, rating,
-    dates, repeat count, notes, or activity.
+    `TRACKABLE`: a ref that can hold user state or activity.
 
     `ORDERED_PARTS`: a node whose part coordinates have meaningful order, such as
     episode number, chapter number, disc/track order, or similar progress positions.
@@ -73,82 +85,72 @@ Implementation guide
     A node may have multiple flags. For example, a TV series is often both an `ANCHOR`
     and a `CONTAINER`, while an episode is often both `CONSUMABLE` and `TRACKABLE`.
 
-4. Choose the user-state shape your provider actually owns
-
-    Return `Record` for current aggregate state about a ref, such as status, progress,
-    rating, dates, repeat count, or notes.
-
-    Return `Event` for immutable timestamped activity, such as a play, scrobble, read,
-    or check-in.
-
-    Return `EventSummary` when the provider can expose aggregate event counts without
-    paging the full event stream.
-
-    Do not emit both per-part `Record`s and `Event`s for the identical fact unless the
-    provider materially exposes both views.
-
 5. Hydrate only the requested projection
 
-    `Node.title`, `Node.url`, and `Part.title` should be cheap labels that are always
-    safe to return.
+    `Node.title`, `Node.url`, `Record.updated_at`, and `Event.at` should be cheap values
+    that are always safe to return.
 
     Facets such as `TITLES`, `ARTWORK`, `IDS`, `STRUCTURE`, and `METADATA` are hydrated
-    only when requested. Record fields follow the same rule through the requested
-    `RecordField` set.
+    only when requested. Record fields and event metadata follow the same rule through
+    their query projections.
 
     Returned objects are frozen value objects, not lazy proxies. Attribute access must
-    never perform I/O. To load more data, query the same `Ref` again with a wider facet
-    or field projection, preferably batched across many refs.
-
-    Create a separate facet only when the data requires a separate fetch, a large
-    payload, or a distinct provider endpoint.
+    never perform I/O. To load more data, query the same `Ref` again with a wider
+    projection, preferably batched across many refs.
 
 6. Keep metadata opaque
 
     Every `metadata: Mapping[str, MetaValue]` is provider passthrough. AniBridge does
-    not plan from it, compare it, or translate it. Metadata is only for display/logging.
+    not plan from it, compare it, or translate it. Metadata is only for display,
+    diagnostics, or provider-specific round trips.
 
     If the bridge must understand a value, model it as a normalized field, facet, flag,
-    descriptor, or constraint instead of putting it in metadata.
+    descriptor, constraint, or channel spec instead of putting it in metadata.
 
 7. Normalize temporal values and constraints
 
     Every datetime crossing this contract must be timezone-aware UTC. A naive datetime
-    is a contract violation. Date-precision values should be represented as `date`,
-    not as artificial midnight datetimes.
+    is a contract violation. Date-precision values should be represented as `date`, not
+    as artificial midnight datetimes.
 
     If a provider only supports date-level precision, advertise that with
-    `TemporalConstraint(precision=TemporalPrecision.DATE)` in the relevant
-    `FieldSpec.constraints`.
+    `TemporalConstraint(precision=TemporalPrecision.DATE)` in the relevant field or
+    event spec.
 
-    Use field constraints to describe what the provider can represent or accept:
-    date-vs-datetime precision, numeric range and step, text length, progress shape,
-    and similar limits. Temporal constraints also tell the bridge how to translate
-    between date and datetime providers.
+    Use constraints to describe what the provider can represent or accept: date-vs-
+    datetime precision, numeric range and step, text length, progress shape, event
+    windows, and similar limits. Temporal constraints also tell the bridge how to
+    translate between date and datetime providers.
 
-    For `RecordField.PROGRESS`, `Progress.current` is the synced user-state value.
-    Providers with bounded or discrete progress counts should describe that current
-    value with `ProgressConstraint(current=NumericConstraint(...))`.
-    `Progress.total` and `Progress.unit` describe the shape of that progress channel.
-    Providers that derive total/unit from media metadata instead of user state should
-    advertise that with `ProgressConstraint(total=False, unit=False)`.
+8. Make record and event syncing first class
 
-8. Separate method presence from method granularity
+    A record-based sync compares `Record` values and writes `RecordWrite`s.
+
+    An event-based sync compares `Event` occurrences and writes `EventWrite`s. Event
+    channels advertise whether events have stable keys and whether repeated append
+    attempts are idempotent, so the planner can replicate events without filtering away
+    legitimate activity.
+
+    A record-to-event or event-to-record sync is a translation between different
+    models. It is allowed, but it should be explicit in the planner instead of being the
+    hidden default contract shape.
+
+9. Separate method presence from method granularity
 
     Add `SupportsX` mixins for the methods your provider implements. For example, use
-    `SupportsScan` for bulk enumeration, `SupportsRecordReads` for record reads, and
-    `SupportsRecordWrites` for record writes.
+    `SupportsScan` for bulk enumeration, `SupportsRecordReads` for record reads,
+    `SupportsEventReads` for event reads, and `SupportsEventWrites` for event writes.
 
     Use `capabilities()` to describe what those methods can actually do: roles, facets,
-    native kind mappings, coordinate axes, record fields, event kinds, write operations,
-    change kinds, and external authorities. `isinstance(provider, SupportsX)` says a
-    method exists, but `capabilities()` says what the method supports.
+    native kind mappings, coordinate axes, record channels, event channels, write
+    operations, change kinds, and external authorities. `isinstance(provider,
+    SupportsX)` says a method exists, while `capabilities()` says what it supports.
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from logging import Logger
 from typing import ClassVar
@@ -160,17 +162,16 @@ __all__ = [
     "BackupArtifact",
     "Capabilities",
     "Change",
+    "ChangeAction",
     "ChangeKind",
     "ChangeQuery",
-    "DeleteEvent",
     "DeleteRecord",
     "Descriptor",
     "Event",
     "EventChange",
     "EventKind",
     "EventQuery",
-    "EventSummary",
-    "EventSummaryQuery",
+    "EventSpec",
     "EventWrite",
     "ExternalId",
     "Facet",
@@ -188,6 +189,7 @@ __all__ = [
     "NodeFlag",
     "NodeKind",
     "NodeQuery",
+    "NodeSpec",
     "NumericConstraint",
     "Page",
     "Part",
@@ -200,6 +202,7 @@ __all__ = [
     "RecordField",
     "RecordKind",
     "RecordQuery",
+    "RecordSpec",
     "RecordWrite",
     "Ref",
     "Role",
@@ -216,7 +219,6 @@ __all__ = [
     "SupportsBackupImports",
     "SupportsChangeFeed",
     "SupportsEventReads",
-    "SupportsEventSummaries",
     "SupportsEventWrites",
     "SupportsInboundChanges",
     "SupportsMapping",
@@ -236,11 +238,61 @@ __all__ = [
     "WriteResult",
 ]
 
-# Record values may contain only non-null scalars. A missing `RecordField` represents
-# "unset", so `None` must not appear as a record value.
 type Scalar = str | int | float | bool
 type ScalarValue = Scalar | None
 type MetaValue = ScalarValue | tuple[ScalarValue, ...]
+
+
+def _validate_utc(value: datetime | None, field_name: str) -> None:
+    """Reject naive or non-UTC datetimes."""
+    if value is None:
+        return
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError(f"{field_name} must be timezone-aware UTC")
+
+
+def _validate_record_values(values: Mapping[RecordField, Value]) -> None:
+    """Validate record values that the type system cannot fully express."""
+    for field_name, value in values.items():
+        if value is None:
+            raise ValueError(f"Record value {field_name} must not be None")
+        if field_name == RecordField.LAST_ACTIVITY_AT:
+            if not isinstance(value, datetime):
+                raise ValueError("LAST_ACTIVITY_AT must be a datetime")
+            _validate_utc(value, "Record.values[LAST_ACTIVITY_AT]")
+        elif isinstance(value, datetime):
+            _validate_utc(value, f"Record.values[{field_name}]")
+
+
+def _validate_status_values(
+    values: tuple[Descriptor[Status], ...], *, writable: bool
+) -> None:
+    """Validate native status descriptor declarations."""
+    seen_native: set[str] = set()
+    seen_writable_semantics: set[Status] = set()
+    for descriptor in values:
+        if descriptor.semantic is None:
+            raise ValueError("STATUS field values must map to a normalized Status")
+        if descriptor.native in seen_native:
+            raise ValueError(f"duplicate STATUS native value: {descriptor.native!r}")
+        seen_native.add(descriptor.native)
+        if not writable:
+            continue
+        if descriptor.semantic in seen_writable_semantics:
+            raise ValueError(
+                f"duplicate writable STATUS semantic: {descriptor.semantic!r}"
+            )
+        seen_writable_semantics.add(descriptor.semantic)
+
+
+def _validate_unique_constraints(constraints: tuple[FieldConstraint, ...]) -> None:
+    """Reject duplicate constraint types in one spec."""
+    seen: set[type[FieldConstraint]] = set()
+    for constraint in constraints:
+        constraint_type = type(constraint)
+        if constraint_type in seen:
+            raise ValueError(f"duplicate constraint type: {constraint_type.__name__}")
+        seen.add(constraint_type)
 
 
 class Role(StrEnum):
@@ -253,16 +305,16 @@ class Role(StrEnum):
 class NodeFlag(StrEnum):
     """Operational semantics the sync engine needs, attached to a catalog node."""
 
-    ANCHOR = "anchor"  # mappable unit; carries cross-provider identity
-    CONTAINER = "container"  # has addressable children/parts
-    CONSUMABLE = "consumable"  # a leaf a user can complete (episode, chapter)
-    TRACKABLE = "trackable"  # user state can be attached here
-    ORDERED_PARTS = "ordered_parts"  # part coordinates carry meaningful order
-    SCAN_ROOT = "scan_root"  # a valid starting point for `scan`
+    ANCHOR = "anchor"
+    CONTAINER = "container"
+    CONSUMABLE = "consumable"
+    TRACKABLE = "trackable"
+    ORDERED_PARTS = "ordered_parts"
+    SCAN_ROOT = "scan_root"
 
 
 class Status(StrEnum):
-    """Provider-neutral status for user state."""
+    """Provider-neutral status for aggregate user state."""
 
     PLANNED = "planned"
     ACTIVE = "active"
@@ -298,11 +350,7 @@ class RecordField(StrEnum):
 
 
 class TemporalPrecision(StrEnum):
-    """Temporal precision advertised for a temporal field constraint.
-
-    If the advertised precision is `DATE`, providers should return date values and
-    the bridge will reduce incoming datetimes during translation.
-    """
+    """Temporal precision advertised for a temporal field or event constraint."""
 
     DATE = "date"
     DATETIME = "datetime"
@@ -310,7 +358,7 @@ class TemporalPrecision(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class TemporalConstraint:
-    """Accepted temporal granularity for a datetime field."""
+    """Accepted temporal granularity."""
 
     precision: TemporalPrecision
 
@@ -384,15 +432,19 @@ class FacetName(StrEnum):
 
 
 class ChangeKind(StrEnum):
-    """What an incremental change touched.
-
-    Advertises change granularity in `Capabilities.change_kinds`. The payloads are the
-    `Change` union.
-    """
+    """Which model an incremental change touched."""
 
     NODE = "node"
     RECORD = "record"
     EVENT = "event"
+
+
+class ChangeAction(StrEnum):
+    """How the changed object moved."""
+
+    UPSERTED = "upserted"
+    DELETED = "deleted"
+    UNKNOWN = "unknown"
 
 
 class WriteOp(StrEnum):
@@ -401,7 +453,6 @@ class WriteOp(StrEnum):
     UPSERT_RECORD = "upsert_record"
     DELETE_RECORD = "delete_record"
     APPEND_EVENT = "append_event"
-    DELETE_EVENT = "delete_event"
 
 
 class WriteError(StrEnum):
@@ -410,14 +461,15 @@ class WriteError(StrEnum):
     `WriteResult.error` carries the human detail.
     """
 
-    UNSUPPORTED = "unsupported"  # op/field not supported here (don't retry)
-    NOT_FOUND = "not_found"  # target ref/record/event doesn't exist
-    CONFLICT = "conflict"  # concurrency / state conflict
-    INVALID = "invalid"  # malformed or rejected input (don't retry as-is)
-    AUTH = "auth"  # auth/permission failure
-    RATE_LIMITED = "rate_limited"  # throttled; retry after backoff
-    TRANSIENT = "transient"  # transient upstream failure; retryable
-    INTERNAL = "internal"  # provider-internal error
+    UNSUPPORTED = "unsupported"
+    NOT_FOUND = "not_found"
+    CONFLICT = "conflict"
+    DUPLICATE = "duplicate"
+    INVALID = "invalid"
+    AUTH = "auth"
+    RATE_LIMITED = "rate_limited"
+    TRANSIENT = "transient"
+    INTERNAL = "internal"
 
 
 class NodeKind(StrEnum):
@@ -425,7 +477,7 @@ class NodeKind(StrEnum):
 
     For display, like-with-like grouping, and choosing the coordinate interpretation.
     Operational sync semantics live in `NodeFlag`. A provider maps its natives onto
-    these in `Capabilities.node_kinds`.
+    these in `Capabilities.nodes`.
     """
 
     SERIES = "series"
@@ -439,29 +491,37 @@ class NodeKind(StrEnum):
 
 
 class RecordKind(StrEnum):
-    """Semantic record kind: which channel of user state a record belongs to.
+    """Semantic record channel kind.
 
-    Lets the bridge sync like with like and never mix channels. Single-list providers
-    (e.g. AniList, MAL) declare just `PROGRESS`. Multi-list providers (e.g. Trakt) split
-    across several. Note `PLANNED` here is a separate list (a watchlist), distinct from
-    `Status.PLANNED` (a planning status inside the progress list). A provider maps its
-    natives in `Capabilities.record_kinds`.
+    Record kinds are current-state channels. Single-list providers often expose only
+    `PROGRESS`. Multi-list providers may split collection, planned/watchlist, ratings,
+    and progress into separate channels.
     """
 
-    PROGRESS = "progress"  # primary consumption state (status/progress/rating)
-    COLLECTION = "collection"  # owned / in library
-    PLANNED = "planned"  # intent to consume, modeled as its own list
-    RATINGS = "ratings"  # ratings kept as a separate list
+    PROGRESS = "progress"
+    COLLECTION = "collection"
+    PLANNED = "planned"
+    RATINGS = "ratings"
 
 
 class EventKind(StrEnum):
-    """Semantic event kind. Mapped in `Capabilities.event_kinds`."""
+    """Semantic event channel kind.
 
-    PLAY = "play"  # a consumption event / scrobble
-    CHECKIN = "checkin"  # a user-initiated check-in
+    `SCROBBLE` is a completed consumption occurrence, regardless of whether the native
+    provider calls it a play, read, listen, or game session. `CHECKIN` is a temporary or
+    real-time declaration that the user is consuming something now. `PROGRESS` captures
+    point-in-time resume or playback position updates without implying completion.
+    """
+
+    SCROBBLE = "scrobble"
+    CHECKIN = "checkin"
+    PROGRESS = "progress"
+    RATING = "rating"
+    REVIEW = "review"
+    COLLECTION = "collection"
+    WATCHLIST = "watchlist"
 
 
-# Closed vocabularies a `Descriptor` can map a native string onto.
 type Semantic = NodeKind | RecordKind | EventKind | Status
 
 
@@ -469,10 +529,9 @@ type Semantic = NodeKind | RecordKind | EventKind | Status
 class Descriptor[S: Semantic]:
     """A native vocabulary value mapped onto a closed shared semantic.
 
-    `native` is the provider's exact term (what it puts in `Node.kind` / `Record.kind` /
-    `Event.kind`, or a native status label). `semantic` is the closed cross-provider
-    meaning the bridge matches on (e.g. native "show" -> `NodeKind.SERIES`).
-    `semantic is None` marks the native as provider-private: used only for display.
+    `native` is the provider's exact term. `semantic` is the closed cross-provider
+    meaning the bridge matches on. `semantic is None` marks the native as provider-
+    private: used only for display or provider-local round trips.
     """
 
     native: str
@@ -484,22 +543,17 @@ class Descriptor[S: Semantic]:
 class ExternalId:
     """A stable external identity used for cross-provider matching.
 
-    In-memory form of an anibridge-mappings *descriptor*
-    (https://github.com/anibridge/anibridge-mappings), whose wire format is
+    In-memory form of an anibridge-mappings descriptor whose wire format is
     `authority:value[:scope]`.
     """
 
-    authority: str  # mappings descriptor "provider"
-    value: str  # mappings descriptor "id"
-    scope: str | None = None  # optional mappings descriptor "scope" for subsetting
+    authority: str
+    value: str
+    scope: str | None = None
 
     @classmethod
     def parse(cls, descriptor: str) -> ExternalId:
-        """Parse an `authority:value[:scope]` descriptor.
-
-        Relies on the dataset invariant that authority/value tokens contain no
-        colons, so a 3-field split yields a scope and a 2-field split does not.
-        """
+        """Parse an `authority:value[:scope]` descriptor."""
         parts = descriptor.split(":")
         if len(parts) == 2:
             authority, value = parts
@@ -525,7 +579,7 @@ class ExternalId:
 class Step:
     """One coordinate on the path into an anchor's part space."""
 
-    axis: str  # e.g. "season", "episode", "chapter", "disc", "track"
+    axis: str
     value: int | str
 
 
@@ -533,10 +587,10 @@ class Step:
 class Ref:
     """Addresses an anchor, or a part within it via `path`.
 
-    `key` is the provider's identifier for the anchor (the mappable unit). An empty
-    `path` points at the anchor; a non-empty path points at a coordinate inside it. The
-    same (anchor, path) aligns across providers even when one materializes the part as
-    its own object and another does not.
+    `key` is the provider's identifier for the anchor. An empty `path` points at the
+    anchor; a non-empty path points at a coordinate inside it. The same `(anchor, path)`
+    aligns across providers even when one materializes the part as its own object and
+    another does not.
     """
 
     key: str
@@ -581,13 +635,18 @@ class Match:
     ref: Ref
     confidence: float | None = None
 
+    def __post_init__(self) -> None:
+        """Validate match invariants."""
+        if self.confidence is not None and not 0 <= self.confidence <= 1:
+            raise ValueError("Match.confidence must be between 0 and 1")
+
 
 @dataclass(frozen=True, slots=True)
 class Titles:
     """TITLES facet."""
 
     primary: str
-    alternates: dict[str, str] = field(default_factory=dict)  # {lang_code: title}
+    alternates: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,10 +720,10 @@ class Node:
     """
 
     ref: Ref
-    kind: str  # open string, advertised in `Capabilities.node_kinds`
+    kind: str
     title: str | None = None
     url: str | None = None
-    labels: tuple[str, ...] = ()  # presentation labels for the web UI
+    labels: tuple[str, ...] = ()
     flags: frozenset[NodeFlag] = field(default_factory=frozenset)
     facets: Mapping[FacetName, Facet] = field(default_factory=dict)
 
@@ -676,18 +735,31 @@ class State:
     native: str | None = None
     status: Status | None = None
 
+    def __post_init__(self) -> None:
+        """Reject state values with no comparable meaning."""
+        if self.native is None and self.status is None:
+            raise ValueError("State must include native, status, or both")
+
 
 @dataclass(frozen=True, slots=True)
 class Progress:
     """A progress channel.
 
-    `unit` is provider-native and open-ended, such as "episode", "page", or
-    "minute".
+    `current` is the comparable user-state value. `total` and `unit` describe the shape
+    of that channel and may be omitted when the provider derives them from catalog data.
+    `unit` is provider-native and open-ended, such as "episode", "page", or "minute".
     """
 
     current: int | float | None
     total: int | float | None = None
     unit: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate progress invariants."""
+        if self.current is not None and self.current < 0:
+            raise ValueError("Progress.current must be >= 0")
+        if self.total is not None and self.total < 0:
+            raise ValueError("Progress.total must be >= 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,64 +767,78 @@ class Rating:
     """A rating with its native scale (e.g. 4.5 on a scale of 5)."""
 
     value: float
-    scale: tuple[float, float, float]  # (min, max, step)
+    scale: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        """Validate rating invariants."""
+        minimum, maximum, step = self.scale
+        if minimum > maximum:
+            raise ValueError("Rating.scale minimum must be <= maximum")
+        if step <= 0:
+            raise ValueError("Rating.scale step must be > 0")
+        if not minimum <= self.value <= maximum:
+            raise ValueError("Rating.value must be within Rating.scale")
 
 
-# The value union for record fields. A field is unset by being absent from
-# `Record.values`, never by storing `None`.
 type Value = State | Progress | Rating | Scalar | date | datetime
 
 
 @dataclass(frozen=True, slots=True)
 class Record:
-    """Aggregate user state about a ref.
+    """Current aggregate user state about a ref.
 
-    `kind` distinguishes coexisting state channels for the same ref, such as Trakt's
-    "watched", "collection", and "watchlist" records. Single-list providers should
-    use the default kind.
+    `kind` names a provider-native state channel advertised by `RecordSpec`. `key` is a
+    provider record id when the provider has one. `updated_at` is the mutation time for
+    this aggregate state, not the time of the underlying activity being represented.
 
-    `revision` is an optional optimistic-concurrency token echoed back on writes. In
-    `values`, an absent `RecordField` means "unknown" or "unset". Never store an
+    In `values`, an absent `RecordField` means "unknown" or "unset". Never store an
     explicit `None`; use `UpsertRecord.clear` to remove fields.
     """
 
     ref: Ref
-    kind: str = ""  # advertised in Capabilities.record_kinds
-    key: str | None = None  # provider's record id, if any
+    kind: str
+    key: str | None = None
     url: str | None = None
-    updated_at: datetime | None = None  # last mutation time (UTC); drives LWW
+    updated_at: datetime | None = None
     revision: str | None = None
     ids: tuple[ExternalId, ...] = ()
     values: Mapping[RecordField, Value] = field(default_factory=dict)
     metadata: Mapping[str, MetaValue] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate record invariants."""
+        if not self.kind:
+            raise ValueError("Record.kind must name a record channel")
+        _validate_utc(self.updated_at, "Record.updated_at")
+        _validate_record_values(self.values)
+
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    """A timestamped user activity on a ref.
+    """An immutable timestamped user activity occurrence.
 
-    `at` must be timezone-aware UTC.
-    """
-
-    ref: Ref
-    kind: str  # advertised in Capabilities.event_kinds
-    at: datetime
-    key: str | None = None
-    metadata: Mapping[str, MetaValue] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class EventSummary:
-    """Aggregated event counts for efficient planning.
-
-    `first_at` and `last_at`, when present, must be timezone-aware UTC.
+    `kind` names a provider-native activity channel advertised by `EventSpec`. `at` is
+    when the activity occurred and must be timezone-aware UTC. `key`, when present, is a
+    stable provider event id. `dedupe_key`, when present, is a stable idempotency
+    signature for append retries and event-to-event replication.
     """
 
     ref: Ref
     kind: str
-    count: int | None = None
-    first_at: datetime | None = None
-    last_at: datetime | None = None
+    at: datetime
+    key: str | None = None
+    dedupe_key: str | None = None
+    recorded_at: datetime | None = None
+    updated_at: datetime | None = None
+    metadata: Mapping[str, MetaValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate event invariants."""
+        if not self.kind:
+            raise ValueError("Event.kind must name an event channel")
+        _validate_utc(self.at, "Event.at")
+        _validate_utc(self.recorded_at, "Event.recorded_at")
+        _validate_utc(self.updated_at, "Event.updated_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,9 +863,9 @@ class BackupArtifact:
 class Page[ItemT]:
     """One page of results with an opaque continuation cursor.
 
-    `total`, when known, is the total number of items matching the query across
-    all pages. Providers may leave it unset when calculating a total would require
-    extra work or the remote API does not expose one.
+    `total`, when known, is the total number of items matching the query across all
+    pages. Providers may leave it unset when calculating a total would require extra
+    work or the remote API does not expose one.
     """
 
     items: tuple[ItemT, ...]
@@ -789,7 +875,12 @@ class Page[ItemT]:
 
 @dataclass(frozen=True, slots=True)
 class ScanItem:
-    """A node paired with its user records during source enumeration."""
+    """A catalog node paired with optional aggregate state.
+
+    Scans are for discovery. They may include aggregate records when the provider can
+    fetch those cheaply, but exact event replication uses `fetch_events` after planning
+    from the scan result.
+    """
 
     node: Node
     records: tuple[Record, ...] = ()
@@ -799,11 +890,12 @@ class ScanItem:
 class NodeQuery:
     """Targeted node lookup.
 
-    Only requested `facets` are hydrated. `native_node_kinds` filters on the
-    provider's own open-string kinds, not the closed semantic `NodeKind`.
+    Only requested `facets` are hydrated. `native_node_kinds` filters on the provider's
+    own open-string kinds, not the closed semantic `NodeKind`.
     """
 
     refs: tuple[Ref, ...] = ()
+    keys: tuple[str, ...] = ()
     native_node_kinds: tuple[str, ...] = ()
     flags: frozenset[NodeFlag] = field(default_factory=frozenset)
     facets: frozenset[FacetName] = field(default_factory=frozenset)
@@ -816,70 +908,92 @@ class RecordQuery:
     """Selective record lookup.
 
     Only requested `fields` are hydrated. `native_record_kinds` filters on the
-    provider's own open-string kinds.
+    provider's own open-string record channels.
     """
 
     refs: tuple[Ref, ...] = ()
     keys: tuple[str, ...] = ()
     native_record_kinds: tuple[str, ...] = ()
     fields: frozenset[RecordField] = field(default_factory=frozenset)
+    changed_after: datetime | None = None
     cursor: str | None = None
     limit: int | None = None
 
-
-@dataclass(frozen=True, slots=True)
-class ScanQuery:
-    """Source enumeration.
-
-    `ScanQuery` is separate from `NodeQuery`, which is optimized for targeted ref
-    lookups. The `native_*_kinds` filters use the provider's own open-string kinds.
-    When `with_records` is true, returned scan items may include user records.
-    """
-
-    sources: tuple[Ref, ...] = ()  # scan roots; empty means the full catalog
-    native_node_kinds: tuple[str, ...] = ()
-    flags: frozenset[NodeFlag] = field(default_factory=frozenset)
-    facets: frozenset[FacetName] = field(default_factory=frozenset)
-    native_record_kinds: frozenset[str] = field(default_factory=frozenset)
-    fields: frozenset[RecordField] = field(default_factory=frozenset)
-    with_records: bool = True
-    require_activity: bool = False  # include only items with user state
-    cursor: str | None = None
-    limit: int | None = None
+    def __post_init__(self) -> None:
+        """Validate record query invariants."""
+        _validate_utc(self.changed_after, "RecordQuery.changed_after")
 
 
 @dataclass(frozen=True, slots=True)
 class EventQuery:
     """Detailed event lookup.
 
-    `native_event_kinds` filters on the provider's own open-string event kinds.
+    `native_event_kinds` filters on the provider's own open-string activity channels.
+    `start_at` is inclusive and `end_at` is exclusive. `with_metadata` controls only
+    opaque metadata hydration; event identity and timestamps are always returned.
     """
 
     refs: tuple[Ref, ...] = ()
+    keys: tuple[str, ...] = ()
     native_event_kinds: tuple[str, ...] = ()
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    changed_after: datetime | None = None
+    with_metadata: bool = False
     cursor: str | None = None
     limit: int | None = None
 
+    def __post_init__(self) -> None:
+        """Validate event query invariants."""
+        _validate_utc(self.start_at, "EventQuery.start_at")
+        _validate_utc(self.end_at, "EventQuery.end_at")
+        _validate_utc(self.changed_after, "EventQuery.changed_after")
+        if (
+            self.start_at is not None
+            and self.end_at is not None
+            and self.start_at > self.end_at
+        ):
+            raise ValueError("EventQuery.start_at must be <= end_at")
+
 
 @dataclass(frozen=True, slots=True)
-class EventSummaryQuery:
-    """Aggregate event lookup.
+class ScanQuery:
+    """Source enumeration.
 
-    `native_event_kinds` filters on the provider's own open-string event kinds.
+    `ScanQuery` is separate from targeted node/record/event queries. It discovers nodes
+    and may attach cheap record state. `native_*_kinds` filters use the provider's own
+    open-string channels.
     """
 
-    refs: tuple[Ref, ...] = ()
-    native_event_kinds: tuple[str, ...] = ()
+    sources: tuple[Ref, ...] = ()
+    native_node_kinds: tuple[str, ...] = ()
+    flags: frozenset[NodeFlag] = field(default_factory=frozenset)
+    facets: frozenset[FacetName] = field(default_factory=frozenset)
+    native_record_kinds: frozenset[str] = field(default_factory=frozenset)
+    record_fields: frozenset[RecordField] = field(default_factory=frozenset)
+    include_records: bool = True
+    require_user_data: bool = False
     cursor: str | None = None
     limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ChangeQuery:
-    """Incremental change-feed poll."""
+    """Incremental change-feed poll.
+
+    `cursor` is provider-owned and should be preferred when available. `changed_after`
+    is a fallback for providers with timestamp polling. `kinds` filters the model type
+    of changes requested.
+    """
 
     cursor: str | None = None
+    changed_after: datetime | None = None
+    kinds: frozenset[ChangeKind] = field(default_factory=frozenset)
     limit: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate change query invariants."""
+        _validate_utc(self.changed_after, "ChangeQuery.changed_after")
 
 
 @dataclass(frozen=True, slots=True)
@@ -892,22 +1006,36 @@ class UpsertRecord:
     """
 
     ref: Ref
-    kind: str = ""
+    kind: str
     key: str | None = None
     token: str | None = None
     expected_revision: str | None = None
     set: Mapping[RecordField, Value] = field(default_factory=dict)
     clear: frozenset[RecordField] = field(default_factory=frozenset)
 
+    def __post_init__(self) -> None:
+        """Validate upsert invariants."""
+        if not self.kind:
+            raise ValueError("UpsertRecord.kind must name a record channel")
+        _validate_record_values(self.set)
+        overlap = set(self.set).intersection(self.clear)
+        if overlap:
+            raise ValueError(f"fields cannot be both set and cleared: {overlap!r}")
+
 
 @dataclass(frozen=True, slots=True)
 class DeleteRecord:
-    """Delete a record by key, or by (ref, kind)."""
+    """Delete a record by key, or by `(ref, kind)`."""
 
     ref: Ref | None = None
-    kind: str = ""
+    kind: str | None = None
     key: str | None = None
     token: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate delete-record invariants."""
+        if self.key is None and (self.ref is None or not self.kind):
+            raise ValueError("DeleteRecord requires key or both ref and kind")
 
 
 type RecordWrite = UpsertRecord | DeleteRecord
@@ -917,40 +1045,35 @@ type RecordWrite = UpsertRecord | DeleteRecord
 class AppendEvent:
     """Append one activity event.
 
-    `at` must be timezone-aware UTC. Event appends are at-least-once from AniBridge's
-    side: `token` is a correlation tag, not a deduplication key. A provider that cannot
-    deduplicate naturally should treat a repeated `(ref, kind, at)` as the same event
-    to keep retries idempotent.
+    `at` must be timezone-aware UTC. `dedupe_key`, when present, is a provider-neutral
+    idempotency signature chosen by AniBridge. Providers that advertise idempotent
+    appends must treat repeated writes with the same dedupe key as the same event.
     """
 
     ref: Ref
     kind: str
     at: datetime
     token: str | None = None
+    dedupe_key: str | None = None
     metadata: Mapping[str, MetaValue] = field(default_factory=dict)
 
-
-@dataclass(frozen=True, slots=True)
-class DeleteEvent:
-    """Delete an event by key, or by a specific `(ref, kind, at)` signature."""
-
-    key: str | None = None
-    ref: Ref | None = None
-    kind: str | None = None
-    at: datetime | None = None
-    token: str | None = None
+    def __post_init__(self) -> None:
+        """Validate append-event invariants."""
+        if not self.kind:
+            raise ValueError("AppendEvent.kind must name an event channel")
+        _validate_utc(self.at, "AppendEvent.at")
 
 
-type EventWrite = AppendEvent | DeleteEvent
+type EventWrite = AppendEvent
 
 
 @dataclass(frozen=True, slots=True)
 class WriteResult:
     """Outcome of one write, returned positionally with its input.
 
-    `token` echoes the request's correlation tag for extra safety. On failure, `code`
-    is the machine-readable reason that drives retry, skip, or abort behavior, and
-    `error` is optional human-readable detail.
+    `token` echoes the request's correlation tag for extra safety. On failure, `code` is
+    the machine-readable reason that drives retry, skip, or abort behavior, and `error`
+    is optional human-readable detail.
     """
 
     ok: bool
@@ -962,6 +1085,13 @@ class WriteResult:
     code: WriteError | None = None
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        """Validate write-result invariants."""
+        if self.ok and (self.code is not None or self.error is not None):
+            raise ValueError("successful WriteResult must not include code or error")
+        if not self.ok and self.code is None:
+            raise ValueError("failed WriteResult must include code")
+
 
 @dataclass(frozen=True, slots=True)
 class NodeChange:
@@ -971,36 +1101,57 @@ class NodeChange:
     changed facets are unknown and the node should be reread fully.
     """
 
+    action: ChangeAction = ChangeAction.UNKNOWN
     ref: Ref | None = None
     key: str | None = None
-    at: datetime | None = None  # UTC
+    at: datetime | None = None
     facets: frozenset[FacetName] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        """Validate node-change invariants."""
+        _validate_utc(self.at, "NodeChange.at")
 
 
 @dataclass(frozen=True, slots=True)
 class RecordChange:
     """A record change.
 
-    `kind` is the affected record kind. `fields` names what changed for targeted
+    `kind` is the affected record channel. `fields` names what changed for targeted
     rehydration. Empty `fields` means the changed fields are unknown and the record
     should be reread fully.
     """
 
+    action: ChangeAction = ChangeAction.UNKNOWN
     ref: Ref | None = None
     key: str | None = None
-    kind: str = ""
-    at: datetime | None = None  # UTC
+    kind: str | None = None
+    at: datetime | None = None
     fields: frozenset[RecordField] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        """Validate record-change invariants."""
+        _validate_utc(self.at, "RecordChange.at")
 
 
 @dataclass(frozen=True, slots=True)
 class EventChange:
-    """An event change. `kind` is the event kind affected."""
+    """An event change.
 
+    Event changes refer to immutable activity occurrences. Providers that only expose a
+    broad activity invalidation may omit `key`, `ref`, and `at`, but should include the
+    affected `kind` when known.
+    """
+
+    action: ChangeAction = ChangeAction.UNKNOWN
     ref: Ref | None = None
     key: str | None = None
-    kind: str = ""
-    at: datetime | None = None  # UTC
+    dedupe_key: str | None = None
+    kind: str | None = None
+    at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Validate event-change invariants."""
+        _validate_utc(self.at, "EventChange.at")
 
 
 type Change = NodeChange | RecordChange | EventChange
@@ -1026,6 +1177,7 @@ class InboundResult:
 
     matched: bool
     changes: tuple[Change, ...] = ()
+    cursor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1042,46 +1194,86 @@ class FieldSpec:
     readable: bool = True
     writable: bool = False
     constraints: tuple[FieldConstraint, ...] = ()
-    values: tuple[Descriptor[Status], ...] = ()  # native status labels
+    values: tuple[Descriptor[Status], ...] = ()
     description: str | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous field capability declarations."""
         if self.field != RecordField.STATUS and self.values:
             raise ValueError("FieldSpec.values is only valid for RecordField.STATUS")
-
         if self.field == RecordField.STATUS and (self.readable or self.writable):
             if not self.values:
                 raise ValueError("STATUS fields must declare supported native values")
-
-            seen_native: set[str] = set()
-            seen_writable_semantics: set[Status] = set()
-            for descriptor in self.values:
-                if descriptor.semantic is None:
-                    raise ValueError(
-                        "STATUS field values must map to a normalized Status"
-                    )
-                if descriptor.native in seen_native:
-                    raise ValueError(
-                        f"duplicate STATUS native value: {descriptor.native!r}"
-                    )
-                seen_native.add(descriptor.native)
-                if not self.writable:
-                    continue
-                if descriptor.semantic in seen_writable_semantics:
-                    raise ValueError(
-                        f"duplicate writable STATUS semantic: {descriptor.semantic!r}"
-                    )
-                seen_writable_semantics.add(descriptor.semantic)
-
+            _validate_status_values(self.values, writable=self.writable)
+        # Validate unique contraint
         seen: set[type[FieldConstraint]] = set()
         for constraint in self.constraints:
             constraint_type = type(constraint)
             if constraint_type in seen:
                 raise ValueError(
-                    f"duplicate field constraint type: {constraint_type.__name__}"
+                    f"duplicate constraint type: {constraint_type.__name__}"
                 )
             seen.add(constraint_type)
+
+
+@dataclass(frozen=True, slots=True)
+class NodeSpec:
+    """Capability declaration for one native node kind."""
+
+    kind: Descriptor[NodeKind]
+    flags: frozenset[NodeFlag] = field(default_factory=frozenset)
+    coordinate_axes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RecordSpec:
+    """Capability declaration for one native aggregate-state channel.
+
+    `kind.native` is the string used in `Record.kind`. `fields` are scoped to this
+    channel, so a provider can expose ratings as writable in one channel and read-only
+    inside progress records. `write_ops` must only contain record operations.
+    """
+
+    kind: Descriptor[RecordKind]
+    fields: Mapping[RecordField, FieldSpec] = field(default_factory=dict)
+    write_ops: frozenset[WriteOp] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        """Validate record channel declarations."""
+        invalid = self.write_ops.difference(
+            {WriteOp.UPSERT_RECORD, WriteOp.DELETE_RECORD}
+        )
+        if invalid:
+            raise ValueError(
+                f"RecordSpec.write_ops contains event operations: {invalid}"
+            )
+        for field_name, spec in self.fields.items():
+            if field_name != spec.field:
+                raise ValueError("RecordSpec.fields keys must match FieldSpec.field")
+
+
+@dataclass(frozen=True, slots=True)
+class EventSpec:
+    """Capability declaration for one native activity channel.
+
+    `kind.native` is the string used in `Event.kind`. `idempotent_appends` says whether
+    repeated appends with the same `AppendEvent.dedupe_key` avoid duplicate events.
+    """
+
+    kind: Descriptor[EventKind]
+    write_ops: frozenset[WriteOp] = field(default_factory=frozenset)
+    temporal: TemporalConstraint = field(
+        default_factory=lambda: TemporalConstraint(TemporalPrecision.DATETIME)
+    )
+    idempotent_appends: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate event channel declarations."""
+        invalid = self.write_ops.difference({WriteOp.APPEND_EVENT})
+        if invalid:
+            raise ValueError(
+                f"EventSpec.write_ops contains record operations: {invalid}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1091,27 +1283,18 @@ class Capabilities:
     Method presence is answered by `isinstance(provider, SupportsX)`. `Capabilities`
     describes what those methods support.
 
-    `node_kinds`, `record_kinds`, and `event_kinds` map native kind strings onto closed
-    semantics so the bridge can translate across providers. `coordinate_axes` maps a
-    native node kind to its ordered axis vocabulary, such as "show" -> ("season",
-    "episode"), so the bridge can know a kind's coordinate space without hydrating
-    `STRUCTURE`.
-
-    `external_authorities` holds AniMap descriptor authority tokens this provider can
-    emit or resolve. These are mapping-database identifiers, not provider namespaces:
-    `Provider.NAMESPACE` identifies the AniBridge plugin/provider implementation, while
-    authorities such as "anilist", "tmdb_show", or "tvdb_movie" identify mapping graph
-    nodes.
+    `nodes`, `records`, and `events` map native channel/kind strings onto closed
+    semantics so the bridge can translate across providers. `external_authorities` holds
+    AniMap descriptor authority tokens this provider can emit or resolve. These are
+    mapping-database identifiers, not provider namespaces: `Provider.NAMESPACE`
+    identifies the AniBridge plugin/provider implementation.
     """
 
     roles: frozenset[Role] = field(default_factory=frozenset)
     facets: frozenset[FacetName] = field(default_factory=frozenset)
-    node_kinds: tuple[Descriptor[NodeKind], ...] = ()
-    coordinate_axes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-    record_kinds: tuple[Descriptor[RecordKind], ...] = ()
-    record_fields: Mapping[RecordField, FieldSpec] = field(default_factory=dict)
-    event_kinds: tuple[Descriptor[EventKind], ...] = ()
-    write_ops: frozenset[WriteOp] = field(default_factory=frozenset)
+    nodes: tuple[NodeSpec, ...] = ()
+    records: tuple[RecordSpec, ...] = ()
+    events: tuple[EventSpec, ...] = ()
     change_kinds: frozenset[ChangeKind] = field(default_factory=frozenset)
     external_authorities: frozenset[str] = field(default_factory=frozenset)
 
@@ -1190,11 +1373,11 @@ class SupportsNodeSearch(ABC):
 
 
 class SupportsScan(ABC):
-    """Source enumeration."""
+    """Source enumeration for discovery."""
 
     @abstractmethod
     async def scan(self, query: ScanQuery) -> Page[ScanItem]:
-        """Scan provider content in bulk, optionally including records."""
+        """Scan provider content in bulk."""
 
 
 class SupportsMapping(ABC):
@@ -1212,7 +1395,7 @@ class SupportsMapping(ABC):
 
 
 class SupportsRecordReads(ABC):
-    """Selective record reads."""
+    """Selective aggregate-state reads."""
 
     @abstractmethod
     async def fetch_records(self, query: RecordQuery) -> Page[Record]:
@@ -1220,7 +1403,7 @@ class SupportsRecordReads(ABC):
 
 
 class SupportsRecordWrites(ABC):
-    """Record mutations. Granularity is advertised in `write_ops`.
+    """Record mutations. Granularity is advertised in `RecordSpec.write_ops`.
 
     Results are positional and independent. Providers may optimize multiple writes
     internally, but should not expose partial batch ambiguity: when one write fails,
@@ -1236,25 +1419,15 @@ class SupportsRecordWrites(ABC):
 
 
 class SupportsEventReads(ABC):
-    """Detailed event reads."""
+    """Detailed immutable activity reads."""
 
     @abstractmethod
     async def fetch_events(self, query: EventQuery) -> Page[Event]:
         """Fetch detailed events matching the query."""
 
 
-class SupportsEventSummaries(ABC):
-    """Aggregated event reads for efficient planning."""
-
-    @abstractmethod
-    async def fetch_event_summaries(
-        self, query: EventSummaryQuery
-    ) -> Page[EventSummary]:
-        """Fetch aggregate event summaries matching the query."""
-
-
 class SupportsEventWrites(ABC):
-    """Event mutations. Granularity is advertised in `write_ops`."""
+    """Event mutations. Granularity is advertised in `EventSpec.write_ops`."""
 
     @abstractmethod
     async def write_events(self, writes: Sequence[EventWrite]) -> Sequence[WriteResult]:
