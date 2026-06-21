@@ -268,14 +268,10 @@ def _validate_status_values(
     values: tuple[Descriptor[Status], ...], *, writable: bool
 ) -> None:
     """Validate native status descriptor declarations."""
-    seen_native: set[str] = set()
     seen_writable_semantics: set[Status] = set()
     for descriptor in values:
         if descriptor.semantic is None:
             raise ValueError("STATUS field values must map to a normalized Status")
-        if descriptor.native in seen_native:
-            raise ValueError(f"duplicate STATUS native value: {descriptor.native!r}")
-        seen_native.add(descriptor.native)
         if not writable:
             continue
         if descriptor.semantic in seen_writable_semantics:
@@ -1186,8 +1182,10 @@ class FieldSpec:
 
     The value shape is fixed by `RecordField`, so it is not restated here. `constraints`
     declares the provider's native limits for this field, such as date-only datetimes,
-    whole-number rating scales, or maximum note length. `values` declares native status
-    labels and their semantics for the `STATUS` field.
+    whole-number rating scales, or maximum note length. `values` declares representable
+    status semantics for the `STATUS` field and the native status value a provider uses
+    for each semantic. Native values may repeat when a provider distinguishes statuses
+    through side-channel fields.
     """
 
     field: RecordField
