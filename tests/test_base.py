@@ -22,6 +22,7 @@ from anibridge.provider.base import (
     EventSpec,
     ExternalId,
     FacetName,
+    FieldConstraint,
     FieldSpec,
     Identifiers,
     InboundRequest,
@@ -43,9 +44,9 @@ from anibridge.provider.base import (
     Record,
     RecordChange,
     RecordField,
-    RecordKind,
     RecordQuery,
     RecordSpec,
+    RecordUnit,
     Ref,
     Role,
     ScanItem,
@@ -65,6 +66,8 @@ from anibridge.provider.base import (
     SupportsRecordReads,
     SupportsRecordWrites,
     SupportsScan,
+    TemporalConstraint,
+    TemporalPrecision,
     TextConstraint,
     Titles,
     UpsertRecord,
@@ -204,21 +207,71 @@ def test_field_spec_rejects_duplicate_writable_status_semantics() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "constraint"),
+    [
+        (RecordField.STATUS, TextConstraint(max_length=10)),
+        (RecordField.PROGRESS, NumericConstraint(0, 10, 1)),
+        (RecordField.RATING, TextConstraint(max_length=10)),
+        (RecordField.REPEAT_COUNT, TextConstraint(max_length=10)),
+        (
+            RecordField.STARTED_AT,
+            NumericConstraint(0, 10, 1),
+        ),
+        (RecordField.NOTES, NumericConstraint(0, 10, 1)),
+    ],
+)
+def test_field_spec_rejects_constraints_for_wrong_field(
+    field: RecordField,
+    constraint: FieldConstraint,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"{type(constraint).__name__} is not valid for {field.value}"),
+    ):
+        FieldSpec(
+            field,
+            readable=False,
+            writable=False,
+            constraints=(constraint,),
+        )
+
+
+def test_field_spec_accepts_constraints_for_matching_field_types() -> None:
+    FieldSpec(
+        RecordField.PROGRESS,
+        constraints=(ProgressConstraint(current=NumericConstraint(0, None, 1)),),
+    )
+    FieldSpec(RecordField.RATING, constraints=(NumericConstraint(0, 10, 1),))
+    FieldSpec(RecordField.REPEAT_COUNT, constraints=(NumericConstraint(0, None, 1),))
+    FieldSpec(
+        RecordField.STARTED_AT,
+        constraints=(TemporalConstraint(TemporalPrecision.DATE),),
+    )
+    FieldSpec(RecordField.NOTES, constraints=(TextConstraint(max_length=1000),))
+
+
 def test_specs_reject_mismatched_fields_and_wrong_write_ops() -> None:
     with pytest.raises(
         ValueError,
         match=re.escape("RecordSpec.fields keys must match FieldSpec.field"),
     ):
         RecordSpec(
-            Descriptor("progress", RecordKind.PROGRESS),
+            "user_state",
             fields={RecordField.STATUS: FieldSpec(RecordField.NOTES)},
         )
 
     with pytest.raises(ValueError, match="contains event operations"):
         RecordSpec(
-            Descriptor("progress", RecordKind.PROGRESS),
+            "user_state",
             write_ops=frozenset({WriteOp.APPEND_EVENT}),
         )
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape("RecordSpec.surface must name a record surface"),
+    ):
+        RecordSpec("")
 
     with pytest.raises(ValueError, match="contains record operations"):
         EventSpec(
@@ -242,7 +295,7 @@ def test_capabilities_describe_current_provider_vocabularies() -> None:
         coordinate_axes=("season", "episode"),
     )
     record_spec = RecordSpec(
-        Descriptor("progress", RecordKind.PROGRESS),
+        "user_state",
         fields={RecordField.STATUS: status_spec},
         write_ops=frozenset({WriteOp.UPSERT_RECORD}),
     )
@@ -290,7 +343,7 @@ def test_catalog_and_record_value_objects_keep_provider_data() -> None:
     )
     record = Record(
         ref=ref,
-        kind="progress",
+        surface="user_state",
         key="record-1",
         updated_at=datetime(2026, 1, 1, tzinfo=UTC),
         ids=(external_id,),
@@ -307,10 +360,22 @@ def test_catalog_and_record_value_objects_keep_provider_data() -> None:
     assert record.values[RecordField.PROGRESS] == Progress(1, 12, "episode")
 
 
+def test_record_rejects_duplicate_unit_indexes() -> None:
+    with pytest.raises(
+        ValueError,
+        match=re.escape("Record.units indexes must be unique"),
+    ):
+        Record(
+            Ref.anchor("show-1"),
+            "user_state",
+            units=(RecordUnit(1), RecordUnit(1)),
+        )
+
+
 def test_pages_and_queries_hold_pagination_and_projection_state() -> None:
     ref = Ref.anchor("show-1")
     node = Node(ref, "show")
-    record = Record(ref, "progress")
+    record = Record(ref, "user_state")
     scan_item = ScanItem(node, (record,))
 
     node_page = Page((node,), cursor="next", total=2)
@@ -318,14 +383,14 @@ def test_pages_and_queries_hold_pagination_and_projection_state() -> None:
         sources=(ref,),
         flags=frozenset({NodeFlag.SCAN_ROOT}),
         facets=frozenset({FacetName.TITLES}),
-        native_record_kinds=frozenset({"progress"}),
+        record_surfaces=frozenset({"user_state"}),
         record_fields=frozenset({RecordField.STATUS}),
         require_user_data=True,
         limit=25,
     )
     record_query = RecordQuery(
         refs=(ref,),
-        native_record_kinds=("progress",),
+        record_surfaces=("user_state",),
         fields=frozenset({RecordField.STATUS}),
     )
 
@@ -334,7 +399,7 @@ def test_pages_and_queries_hold_pagination_and_projection_state() -> None:
     assert scan_item.records == (record,)
     assert scan_query.sources == (ref,)
     assert scan_query.require_user_data is True
-    assert record_query.native_record_kinds == ("progress",)
+    assert record_query.record_surfaces == ("user_state",)
 
 
 def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
@@ -343,7 +408,7 @@ def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
 
     upsert = UpsertRecord(
         ref,
-        kind="progress",
+        surface="user_state",
         key="record-1",
         token="tok-1",
         expected_revision="rev-1",
@@ -364,7 +429,7 @@ def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
     assert append_event.dedupe_key == "d1"
     assert result.error == "stale revision"
     assert NodeChange(ref=ref, at=now).at == now
-    assert RecordChange(ref=ref, kind="progress", at=now).kind == "progress"
+    assert RecordChange(ref=ref, surface="user_state", at=now).surface == "user_state"
     assert EventChange(ref=ref, kind="scrobble", at=now).kind == "scrobble"
     assert InboundResult(True, (NodeChange(ref=ref),)).matched is True
     assert InboundRequest("POST", "/hook", body=b"{}").body == b"{}"

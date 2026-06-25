@@ -31,8 +31,11 @@ Implementation guide
     `Node` is catalog data. It describes what exists, how it is identified, and what
     coordinate space it has.
 
-    `Record` is current aggregate state about a ref in a named state channel, such as
-    progress, collection, watchlist, or ratings. Records are compared as latest state.
+    `Record` is current aggregate user state about a ref on a provider-local record
+    surface, such as `media_list`, `anime_list`, or `user_state`. A surface names the
+    native state API/table/object family a provider reads or writes; it is a dispatch
+    handle, not sync semantics. Records are
+    compared as latest state.
 
     `Event` is immutable timestamped activity in a named activity channel, such as a
     scrobble, check-in, rating, review, collection, or watchlist occurrence. Events are
@@ -41,19 +44,18 @@ Implementation guide
 
 3. Advertise native vocabularies through capabilities
 
-    Provider-native names are open strings. Use them in `Node.kind`, `Record.kind`,
-    `Event.kind`, `Step.axis`, `Progress.unit`, and artwork roles.
+    Provider-native names are open strings. Use them in `Node.kind`,
+    `Record.surface`, `Event.kind`, `Step.axis`, `Progress.unit`, and artwork roles.
 
     Closed enums are the values AniBridge reasons over: `Status`, `RecordField`,
     `NodeFlag`, `FacetName`, `ChangeAction`, `WriteOp`, `TemporalPrecision`,
-    `WriteError`, and the semantic kind enums `NodeKind`, `RecordKind`, and
-    `EventKind`.
+    `WriteError`, and the semantic kind enums `NodeKind` and `EventKind`.
 
-    In `capabilities()`, describe each supported node kind, record channel, and event
-    channel with a spec that maps native strings to a closed semantic. AniBridge never
-    compares native strings across providers. It maps source-native values to semantics,
-    chooses compatible target-native values for those semantics, and translates from
-    there.
+    In `capabilities()`, describe each supported node kind, record surface, and event
+    channel. Node and event specs map native strings to closed semantics. Record specs
+    keep provider-native surfaces as opaque dispatch handles and advertise field
+    capabilities; AniBridge matches records by compatible `RecordField` names rather
+    than by provider surface names.
 
     Use `semantic=None` for native values that should be kept for display or round-trip
     fidelity, but never used for cross-provider sync.
@@ -142,7 +144,7 @@ Implementation guide
     `SupportsEventReads` for event reads, and `SupportsEventWrites` for event writes.
 
     Use `capabilities()` to describe what those methods can actually do: roles, facets,
-    native kind mappings, coordinate axes, record channels, event channels, write
+    native kind mappings, coordinate axes, record surfaces, event channels, write
     operations, change kinds, and external authorities. `isinstance(provider,
     SupportsX)` says a method exists, while `capabilities()` says what it supports.
 """
@@ -200,9 +202,9 @@ __all__ = [
     "Record",
     "RecordChange",
     "RecordField",
-    "RecordKind",
     "RecordQuery",
     "RecordSpec",
+    "RecordUnit",
     "RecordWrite",
     "Ref",
     "Role",
@@ -279,6 +281,34 @@ def _validate_status_values(
                 f"duplicate writable STATUS semantic: {descriptor.semantic!r}"
             )
         seen_writable_semantics.add(descriptor.semantic)
+
+
+def _validate_field_constraints(
+    field_name: RecordField,
+    constraints: tuple[FieldConstraint, ...],
+) -> None:
+    """Reject constraints that do not match a record field's value shape."""
+    _validate_unique_constraints(constraints)
+    if field_name == RecordField.PROGRESS:
+        allowed = (ProgressConstraint,)
+    elif field_name in (RecordField.RATING, RecordField.REPEAT_COUNT):
+        allowed = (NumericConstraint,)
+    elif field_name in (
+        RecordField.STARTED_AT,
+        RecordField.FINISHED_AT,
+        RecordField.LAST_ACTIVITY_AT,
+    ):
+        allowed = (TemporalConstraint,)
+    elif field_name == RecordField.NOTES:
+        allowed = (TextConstraint,)
+    else:
+        allowed = ()
+
+    for constraint in constraints:
+        if not isinstance(constraint, allowed):
+            raise ValueError(
+                f"{type(constraint).__name__} is not valid for {field_name.value}"
+            )
 
 
 def _validate_unique_constraints(constraints: tuple[FieldConstraint, ...]) -> None:
@@ -486,20 +516,6 @@ class NodeKind(StrEnum):
     GAME = "game"
 
 
-class RecordKind(StrEnum):
-    """Semantic record channel kind.
-
-    Record kinds are current-state channels. Single-list providers often expose only
-    `PROGRESS`. Multi-list providers may split collection, planned/watchlist, ratings,
-    and progress into separate channels.
-    """
-
-    PROGRESS = "progress"
-    COLLECTION = "collection"
-    PLANNED = "planned"
-    RATINGS = "ratings"
-
-
 class EventKind(StrEnum):
     """Semantic event channel kind.
 
@@ -518,7 +534,7 @@ class EventKind(StrEnum):
     WATCHLIST = "watchlist"
 
 
-type Semantic = NodeKind | RecordKind | EventKind | Status
+type Semantic = NodeKind | EventKind | Status
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,33 +796,68 @@ type Value = State | Progress | Rating | Scalar | date | datetime
 
 
 @dataclass(frozen=True, slots=True)
+class RecordUnit:
+    """Per-source-unit state that contributes to an aggregate `Record`.
+
+    `index` is the one-based ordinal in the record's source unit space. For a
+    season-level episode record, this is the episode number. For a chapter progress
+    record, this is the chapter number. AniMap ranges address these indexes directly,
+    so planners can project mapped ranges without borrowing values from unrelated units.
+    """
+
+    index: int
+    key: str | None = None
+    values: Mapping[RecordField, Value] = field(default_factory=dict)
+    metadata: Mapping[str, MetaValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate unit invariants."""
+        if self.index < 1:
+            raise ValueError("RecordUnit.index must be >= 1")
+        _validate_record_values(self.values)
+
+
+@dataclass(frozen=True, slots=True)
 class Record:
     """Current aggregate user state about a ref.
 
-    `kind` names a provider-native state channel advertised by `RecordSpec`. `key` is a
-    provider record id when the provider has one. `updated_at` is the mutation time for
-    this aggregate state, not the time of the underlying activity being represented.
+    `surface` is an opaque provider-local dispatch handle advertised by `RecordSpec`.
+    It identifies which native state surface produced the record and which provider
+    write path should receive updates. It must be stable within one provider, but it
+    does not need to match another provider's name for the same concept. AniBridge
+    decides cross-provider compatibility from `RecordSpec.fields`, not from the
+    surface string. `key` is a provider record id when the provider has one.
+    `updated_at` is the mutation time for this aggregate state, not the time of the
+    underlying activity being represented.
 
     In `values`, an absent `RecordField` means "unknown" or "unset". Never store an
     explicit `None`; use `UpsertRecord.clear` to remove fields.
+
+    `units` carries source-unit values behind the aggregate. It is not written to target
+    providers directly; the planner uses it to project mapped ranges without borrowing
+    fields from unrelated units in the same aggregate record.
     """
 
     ref: Ref
-    kind: str
+    surface: str
     key: str | None = None
     url: str | None = None
     updated_at: datetime | None = None
     revision: str | None = None
     ids: tuple[ExternalId, ...] = ()
     values: Mapping[RecordField, Value] = field(default_factory=dict)
+    units: tuple[RecordUnit, ...] = ()
     metadata: Mapping[str, MetaValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate record invariants."""
-        if not self.kind:
-            raise ValueError("Record.kind must name a record channel")
+        if not self.surface:
+            raise ValueError("Record.surface must name a record surface")
         _validate_utc(self.updated_at, "Record.updated_at")
         _validate_record_values(self.values)
+        unit_indexes = [unit.index for unit in self.units]
+        if len(set(unit_indexes)) != len(unit_indexes):
+            raise ValueError("Record.units indexes must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -903,13 +954,13 @@ class NodeQuery:
 class RecordQuery:
     """Selective record lookup.
 
-    Only requested `fields` are hydrated. `native_record_kinds` filters on the
-    provider's own open-string record channels.
+    Only requested `fields` are hydrated. `record_surfaces` filters on opaque
+    provider-local record surfaces.
     """
 
     refs: tuple[Ref, ...] = ()
     keys: tuple[str, ...] = ()
-    native_record_kinds: tuple[str, ...] = ()
+    record_surfaces: tuple[str, ...] = ()
     fields: frozenset[RecordField] = field(default_factory=frozenset)
     changed_after: datetime | None = None
     cursor: str | None = None
@@ -958,14 +1009,14 @@ class ScanQuery:
 
     `ScanQuery` is separate from targeted node/record/event queries. It discovers nodes
     and may attach cheap record state. `native_*_kinds` filters use the provider's own
-    open-string channels.
+    open-string node/event kinds; `record_surfaces` filters record dispatch surfaces.
     """
 
     sources: tuple[Ref, ...] = ()
     native_node_kinds: tuple[str, ...] = ()
     flags: frozenset[NodeFlag] = field(default_factory=frozenset)
     facets: frozenset[FacetName] = field(default_factory=frozenset)
-    native_record_kinds: frozenset[str] = field(default_factory=frozenset)
+    record_surfaces: frozenset[str] = field(default_factory=frozenset)
     record_fields: frozenset[RecordField] = field(default_factory=frozenset)
     include_records: bool = True
     require_user_data: bool = False
@@ -1002,7 +1053,7 @@ class UpsertRecord:
     """
 
     ref: Ref
-    kind: str
+    surface: str
     key: str | None = None
     token: str | None = None
     expected_revision: str | None = None
@@ -1011,8 +1062,8 @@ class UpsertRecord:
 
     def __post_init__(self) -> None:
         """Validate upsert invariants."""
-        if not self.kind:
-            raise ValueError("UpsertRecord.kind must name a record channel")
+        if not self.surface:
+            raise ValueError("UpsertRecord.surface must name a record surface")
         _validate_record_values(self.set)
         overlap = set(self.set).intersection(self.clear)
         if overlap:
@@ -1021,17 +1072,17 @@ class UpsertRecord:
 
 @dataclass(frozen=True, slots=True)
 class DeleteRecord:
-    """Delete a record by key, or by `(ref, kind)`."""
+    """Delete a record by key, or by `(ref, surface)`."""
 
     ref: Ref | None = None
-    kind: str | None = None
+    surface: str | None = None
     key: str | None = None
     token: str | None = None
 
     def __post_init__(self) -> None:
         """Validate delete-record invariants."""
-        if self.key is None and (self.ref is None or not self.kind):
-            raise ValueError("DeleteRecord requires key or both ref and kind")
+        if self.key is None and (self.ref is None or not self.surface):
+            raise ValueError("DeleteRecord requires key or both ref and surface")
 
 
 type RecordWrite = UpsertRecord | DeleteRecord
@@ -1112,7 +1163,7 @@ class NodeChange:
 class RecordChange:
     """A record change.
 
-    `kind` is the affected record channel. `fields` names what changed for targeted
+    `surface` is the affected record surface. `fields` names what changed for targeted
     rehydration. Empty `fields` means the changed fields are unknown and the record
     should be reread fully.
     """
@@ -1120,7 +1171,7 @@ class RecordChange:
     action: ChangeAction = ChangeAction.UNKNOWN
     ref: Ref | None = None
     key: str | None = None
-    kind: str | None = None
+    surface: str | None = None
     at: datetime | None = None
     fields: frozenset[RecordField] = field(default_factory=frozenset)
 
@@ -1203,15 +1254,7 @@ class FieldSpec:
             if not self.values:
                 raise ValueError("STATUS fields must declare supported native values")
             _validate_status_values(self.values, writable=self.writable)
-        # Validate unique contraint
-        seen: set[type[FieldConstraint]] = set()
-        for constraint in self.constraints:
-            constraint_type = type(constraint)
-            if constraint_type in seen:
-                raise ValueError(
-                    f"duplicate constraint type: {constraint_type.__name__}"
-                )
-            seen.add(constraint_type)
+        _validate_field_constraints(self.field, self.constraints)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1225,19 +1268,24 @@ class NodeSpec:
 
 @dataclass(frozen=True, slots=True)
 class RecordSpec:
-    """Capability declaration for one native aggregate-state channel.
+    """Capability declaration for one provider-local aggregate-state surface.
 
-    `kind.native` is the string used in `Record.kind`. `fields` are scoped to this
-    channel, so a provider can expose ratings as writable in one channel and read-only
-    inside progress records. `write_ops` must only contain record operations.
+    `surface` is an opaque provider dispatch handle used in `Record.surface`. It names
+    one provider-local aggregate-state surface: for example a media-list entry API, an
+    anime-list entry API, or a user-state table. Use multiple surfaces only when the
+    provider has distinct native record stores or write paths with different field
+    capabilities. AniBridge matches record surfaces by compatible field capabilities,
+    not by surface names. `write_ops` must only contain record operations.
     """
 
-    kind: Descriptor[RecordKind]
+    surface: str = "default"
     fields: Mapping[RecordField, FieldSpec] = field(default_factory=dict)
     write_ops: frozenset[WriteOp] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        """Validate record channel declarations."""
+        """Validate record surface declarations."""
+        if not self.surface:
+            raise ValueError("RecordSpec.surface must name a record surface")
         invalid = self.write_ops.difference(
             {WriteOp.UPSERT_RECORD, WriteOp.DELETE_RECORD}
         )
@@ -1281,11 +1329,11 @@ class Capabilities:
     Method presence is answered by `isinstance(provider, SupportsX)`. `Capabilities`
     describes what those methods support.
 
-    `nodes`, `records`, and `events` map native channel/kind strings onto closed
-    semantics so the bridge can translate across providers. `external_authorities` holds
-    AniMap descriptor authority tokens this provider can emit or resolve. These are
-    mapping-database identifiers, not provider namespaces: `Provider.NAMESPACE`
-    identifies the AniBridge plugin/provider implementation.
+    `nodes` and `events` map native channel/kind strings onto closed semantics.
+    `records` advertise provider-native channels and field capabilities.
+    `external_authorities` holds AniMap descriptor authority tokens this provider can
+    emit or resolve. These are mapping-database identifiers, not provider namespaces:
+    `Provider.NAMESPACE` identifies the AniBridge plugin/provider implementation.
     """
 
     roles: frozenset[Role] = field(default_factory=frozenset)
