@@ -48,8 +48,9 @@ Implementation guide
     `Record.surface`, `Event.kind`, `Step.axis`, `Progress.unit`, and artwork roles.
 
     Closed enums are the values AniBridge reasons over: `Status`, `RecordField`,
-    `NodeFlag`, `FacetName`, `ChangeAction`, `WriteOp`, `TemporalPrecision`,
-    `WriteError`, and the semantic kind enums `NodeKind` and `EventKind`.
+    `NodeFlag`, `FacetName`, `ChangeAction`, `RecordWriteOp`, `EventWriteOp`,
+    `TemporalPrecision`, `WriteError`, and the semantic kind enums `NodeKind` and
+    `EventKind`.
 
     In `capabilities()`, describe each supported node kind, record surface, and event
     channel. Node and event specs map native strings to closed semantics. Record specs
@@ -167,6 +168,7 @@ __all__ = [
     "ChangeAction",
     "ChangeKind",
     "ChangeQuery",
+    "DeleteEvent",
     "DeleteRecord",
     "Descriptor",
     "Event",
@@ -175,6 +177,7 @@ __all__ = [
     "EventQuery",
     "EventSpec",
     "EventWrite",
+    "EventWriteOp",
     "ExternalId",
     "Facet",
     "FacetName",
@@ -206,6 +209,7 @@ __all__ = [
     "RecordSpec",
     "RecordUnit",
     "RecordWrite",
+    "RecordWriteOp",
     "Ref",
     "Role",
     "Scalar",
@@ -473,12 +477,21 @@ class ChangeAction(StrEnum):
     UNKNOWN = "unknown"
 
 
-class WriteOp(StrEnum):
-    """Write operations a provider may advertise."""
+class RecordWriteOp(StrEnum):
+    """Record write operations a provider may advertise."""
 
-    UPSERT_RECORD = "upsert_record"
-    DELETE_RECORD = "delete_record"
-    APPEND_EVENT = "append_event"
+    UPSERT = "record.upsert"
+    DELETE = "record.delete"
+
+
+class EventWriteOp(StrEnum):
+    """Event write operations a provider may advertise."""
+
+    APPEND = "event.append"
+    DELETE = "event.delete"
+
+
+type WriteOp = RecordWriteOp | EventWriteOp
 
 
 class WriteError(StrEnum):
@@ -1111,7 +1124,37 @@ class AppendEvent:
         _validate_utc(self.at, "AppendEvent.at")
 
 
-type EventWrite = AppendEvent
+@dataclass(frozen=True, slots=True)
+class DeleteEvent:
+    """Delete an activity event.
+
+    Providers may delete by stable `key`, by `(ref, kind, dedupe_key)`, or by the exact
+    `(ref, kind, at)` occurrence when no stronger identifier exists.
+    """
+
+    ref: Ref | None = None
+    kind: str | None = None
+    at: datetime | None = None
+    key: str | None = None
+    token: str | None = None
+    dedupe_key: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate delete-event invariants."""
+        _validate_utc(self.at, "DeleteEvent.at")
+        if self.key is not None:
+            return
+        if self.ref is None or not self.kind:
+            raise ValueError(
+                "DeleteEvent requires key, or ref and kind with dedupe_key or at"
+            )
+        if self.dedupe_key is None and self.at is None:
+            raise ValueError(
+                "DeleteEvent requires key, or ref and kind with dedupe_key or at"
+            )
+
+
+type EventWrite = AppendEvent | DeleteEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -1275,19 +1318,19 @@ class RecordSpec:
     anime-list entry API, or a user-state table. Use multiple surfaces only when the
     provider has distinct native record stores or write paths with different field
     capabilities. AniBridge matches record surfaces by compatible field capabilities,
-    not by surface names. `write_ops` must only contain record operations.
+    not by surface names.
     """
 
     surface: str = "default"
     fields: Mapping[RecordField, FieldSpec] = field(default_factory=dict)
-    write_ops: frozenset[WriteOp] = field(default_factory=frozenset)
+    write_ops: frozenset[RecordWriteOp] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         """Validate record surface declarations."""
         if not self.surface:
             raise ValueError("RecordSpec.surface must name a record surface")
-        invalid = self.write_ops.difference(
-            {WriteOp.UPSERT_RECORD, WriteOp.DELETE_RECORD}
+        invalid = tuple(
+            op for op in self.write_ops if not isinstance(op, RecordWriteOp)
         )
         if invalid:
             raise ValueError(
@@ -1307,7 +1350,7 @@ class EventSpec:
     """
 
     kind: Descriptor[EventKind]
-    write_ops: frozenset[WriteOp] = field(default_factory=frozenset)
+    write_ops: frozenset[EventWriteOp] = field(default_factory=frozenset)
     temporal: TemporalConstraint = field(
         default_factory=lambda: TemporalConstraint(TemporalPrecision.DATETIME)
     )
@@ -1315,7 +1358,7 @@ class EventSpec:
 
     def __post_init__(self) -> None:
         """Validate event channel declarations."""
-        invalid = self.write_ops.difference({WriteOp.APPEND_EVENT})
+        invalid = tuple(op for op in self.write_ops if not isinstance(op, EventWriteOp))
         if invalid:
             raise ValueError(
                 f"EventSpec.write_ops contains record operations: {invalid}"

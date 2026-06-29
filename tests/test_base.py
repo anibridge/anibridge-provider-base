@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -16,10 +17,12 @@ from anibridge.provider.base import (
     BackupArtifact,
     Capabilities,
     ChangeKind,
+    DeleteEvent,
     Descriptor,
     EventChange,
     EventKind,
     EventSpec,
+    EventWriteOp,
     ExternalId,
     FacetName,
     FieldConstraint,
@@ -47,6 +50,7 @@ from anibridge.provider.base import (
     RecordQuery,
     RecordSpec,
     RecordUnit,
+    RecordWriteOp,
     Ref,
     Role,
     ScanItem,
@@ -72,7 +76,6 @@ from anibridge.provider.base import (
     Titles,
     UpsertRecord,
     WriteError,
-    WriteOp,
     WriteResult,
 )
 
@@ -264,7 +267,7 @@ def test_specs_reject_mismatched_fields_and_wrong_write_ops() -> None:
     with pytest.raises(ValueError, match="contains event operations"):
         RecordSpec(
             "user_state",
-            write_ops=frozenset({WriteOp.APPEND_EVENT}),
+            write_ops=frozenset[Any]({EventWriteOp.APPEND}),
         )
 
     with pytest.raises(
@@ -276,7 +279,7 @@ def test_specs_reject_mismatched_fields_and_wrong_write_ops() -> None:
     with pytest.raises(ValueError, match="contains record operations"):
         EventSpec(
             Descriptor("scrobble", EventKind.SCROBBLE),
-            write_ops=frozenset({WriteOp.UPSERT_RECORD}),
+            write_ops=frozenset[Any]({RecordWriteOp.UPSERT}),
         )
 
 
@@ -297,11 +300,11 @@ def test_capabilities_describe_current_provider_vocabularies() -> None:
     record_spec = RecordSpec(
         "user_state",
         fields={RecordField.STATUS: status_spec},
-        write_ops=frozenset({WriteOp.UPSERT_RECORD}),
+        write_ops=frozenset({RecordWriteOp.UPSERT}),
     )
     event_spec = EventSpec(
         Descriptor("scrobble", EventKind.SCROBBLE),
-        write_ops=frozenset({WriteOp.APPEND_EVENT}),
+        write_ops=frozenset({EventWriteOp.APPEND, EventWriteOp.DELETE}),
         idempotent_appends=True,
     )
 
@@ -416,9 +419,10 @@ def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
         clear=frozenset({RecordField.NOTES}),
     )
     append_event = AppendEvent(ref, "scrobble", now, token="tok-2", dedupe_key="d1")
+    delete_event = DeleteEvent(ref, "scrobble", now, token="tok-3", dedupe_key="d1")
     result = WriteResult(
         ok=False,
-        op=WriteOp.UPSERT_RECORD,
+        op=RecordWriteOp.UPSERT,
         token="tok-1",
         ref=ref,
         code=WriteError.CONFLICT,
@@ -427,12 +431,16 @@ def test_write_and_change_dtos_preserve_correlation_and_error_details() -> None:
 
     assert upsert.expected_revision == "rev-1"
     assert append_event.dedupe_key == "d1"
+    assert delete_event.dedupe_key == "d1"
     assert result.error == "stale revision"
     assert NodeChange(ref=ref, at=now).at == now
     assert RecordChange(ref=ref, surface="user_state", at=now).surface == "user_state"
     assert EventChange(ref=ref, kind="scrobble", at=now).kind == "scrobble"
     assert InboundResult(True, (NodeChange(ref=ref),)).matched is True
     assert InboundRequest("POST", "/hook", body=b"{}").body == b"{}"
+
+    with pytest.raises(ValueError, match="DeleteEvent requires"):
+        DeleteEvent(ref=ref, kind="scrobble")
 
 
 def test_provider_base_stores_logger_and_config() -> None:
